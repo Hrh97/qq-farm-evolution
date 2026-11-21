@@ -9,7 +9,7 @@ services:
 
     ports:
       - "3007:3007"               # 管理面板
-      - "18000-18999:18000-18999" # 抓包登录 MITM 代理端口池（iPhone Wi-Fi 代理连入）
+      - "20000-20039:20000-20039" # 抓包登录 MITM 代理端口池（避开本机 18100 占用；配 CAPTURE_PORTS）
 
     volumes:
       - ../data:/app/core/data
@@ -27,8 +27,8 @@ services:
       FARM_QQ_AUTH_ENABLED: "${FARM_QQ_AUTH_ENABLED:-0}"
       FARM_QQ_AUTH_ENDPOINT: "${FARM_QQ_AUTH_ENDPOINT:-}"
       FARM_QQ_AUTH_SIGNATURE: "${FARM_QQ_AUTH_SIGNATURE:-}"
-      # 抓包服务已嵌入本进程，无需单独启动；可按需调整代理端口池：
-      # CAPTURE_PORTS: "18000-18999"
+      # 抓包服务已嵌入本进程，无需单独启动；端口池改为与宿主机映射一致的空闲段：
+      CAPTURE_PORTS: "20000-20039"
       # 需要固定对外地址时，在 .env 中设置（局域网 / Tailscale 可同时填写）：
       # CAPTURE_ADVERTISE_IPS=203.0.113.10,198.51.100.20
 

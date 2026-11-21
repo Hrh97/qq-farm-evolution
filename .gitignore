@@ -37,3 +37,8 @@ private-config.json
 *.key
 *.p12
 *.pfx
+
+# Local deployment secrets / ops state (never commit)
+deploy-vars.txt
+卡密.txt
+*.task.bak-*.xml
