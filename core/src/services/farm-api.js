@@ -137,7 +137,9 @@ async function fertilize(landIds, fertilizerId = NORMAL_FERTILIZER_ID) {
         land_ids: [toLong(landId)],
         fertilizer_id: toLong(fertilizerId)
       })).finish();
-      await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload);
+      // 逐块施肥以首次业务拒绝收尾（肥料不足/地块已施）属预期结果，
+      // 不计入异常降速阈值；网络超时/断线仍照常计入。
+      await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload, 20000, { breakerExemptBusinessError: true });
       successCount++;
     } catch {
       break;

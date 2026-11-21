@@ -128,7 +128,11 @@ async function claimAllIllustratedRewards() {
   const { body } = await sendMsgAsync(
     'gamepb.illustratedpb.IllustratedService',
     'ClaimAllRewardsV2',
-    request
+    request,
+    20000,
+    // 无可领奖励时服务器返回业务错误属预期结果，不计入异常降速阈值
+    // （网络超时/断线仍照常计入）。与 activity.js 的 discoveryProbe 同机制。
+    { breakerExemptBusinessError: true }
   );
   return types.ClaimAllRewardsV2Reply.decode(body);
 }

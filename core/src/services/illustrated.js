@@ -217,7 +217,10 @@ async function claimAllRewardsV2(onlyClaimable = true) {
   const { body } = await sendMsgAsync(
     'gamepb.illustratedpb.IllustratedService',
     'ClaimAllRewardsV2',
-    request
+    request,
+    20000,
+    // 无可领奖励时服务器返回业务错误属预期结果，不计入异常降速阈值
+    { breakerExemptBusinessError: true }
   );
   return types.ClaimAllRewardsV2Reply.decode(body);
 }

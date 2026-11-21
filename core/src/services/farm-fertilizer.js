@@ -52,7 +52,9 @@ async function fertilizeOrganicLoop(landIds) {
         land_ids: [toNum(landId)],
         fertilizer_id: toNum(ORGANIC_FERTILIZER_ID)
       })).finish();
-      await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload);
+      // 循环施肥以业务拒绝（肥料用尽/地块不可施）收尾属预期结果，
+      // 不计入异常降速阈值；网络超时/断线仍照常计入。
+      await sendMsgAsync('gamepb.plantpb.PlantService', 'Fertilize', payload, 20000, { breakerExemptBusinessError: true });
       successCount++;
     } catch {
       break;
