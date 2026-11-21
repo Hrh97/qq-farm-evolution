@@ -1,4 +1,5 @@
 const nodemailer = require('nodemailer');
+const { sendDingTalkSigned } = require('./dingtalk-sign');
 
 let pushoo = null;
 try {
@@ -72,11 +73,23 @@ function parsePushResult(result) {
  * @returns {{ ok, code, msg, raw }}
  */
 async function sendPushooMessage(payload = {}) {
+  const channel = assertRequiredText('推送渠道', payload.channel).toLowerCase();
+
+  // 钉钉「加签」安全设置：pushoo 内置 dingtalk 渠道只支持关键词模式，
+  // 加签需要 HMAC-SHA256(timestamp + "\n" + secret)，走本地直推实现。
+  // webhook 填完整地址，token 填 SEC 开头的加签密钥；两者都随配置保存在本地。
+  if (channel === 'dingtalk_sign') {
+    return sendDingTalkSigned({
+      webhook: assertRequiredText('钉钉 Webhook', payload.endpoint || payload.webhook),
+      secret: assertRequiredText('钉钉加签密钥', payload.token),
+      title: assertRequiredText('推送标题', payload.title),
+      content: assertRequiredText('推送内容', payload.content),
+    });
+  }
+
   if (!pushoo) {
     throw new Error('缺少 pushoo 依赖，请在 core 目录执行 npm install');
   }
-
-  const channel = assertRequiredText('推送渠道', payload.channel).toLowerCase();
   const endpoint = String(payload.endpoint || '').trim();
   const rawToken = String(payload.token || '').trim();
   const token = channel === 'webhook' ? rawToken : assertRequiredText('推送 token', rawToken);

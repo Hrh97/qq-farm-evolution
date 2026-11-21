@@ -218,7 +218,7 @@ const PUSHOO_CHANNELS = new Set([
     'webhook', 'qmsg', 'serverchan', 'pushplus', 'pushplushxtrip',
     'dingtalk', 'wecom', 'bark', 'gocqhttp', 'onebot', 'atri',
     'pushdeer', 'igot', 'telegram', 'feishu', 'ifttt', 'wecombot',
-    'discord', 'wxpusher',
+    'discord', 'wxpusher', 'dingtalk_sign',
 ]);
 
 // ==================== 默认配置 ====================

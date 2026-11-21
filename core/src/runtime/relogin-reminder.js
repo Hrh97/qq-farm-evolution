@@ -254,8 +254,8 @@ function createReloginReminderService(deps) {
       log('错误', '下线提醒配置不完整: token=未设置');
       return;
     }
-    if (channel === 'webhook' && !endpoint) {
-      log('错误', 'Webhook 渠道未设置接口地址');
+    if ((channel === 'webhook' || channel === 'dingtalk_sign') && !endpoint) {
+      log('错误', `${channel === 'dingtalk_sign' ? '钉钉加签' : 'Webhook'} 渠道未设置接口地址`);
       return;
     }
 

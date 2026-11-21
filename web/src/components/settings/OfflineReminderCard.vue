@@ -131,17 +131,17 @@ const config = defineModel<OfflineReminderConfig>('config', { required: true })
       <template v-else>
         <BaseInput
           v-model="config.endpoint"
-          label="接口地址"
+          :label="config.channel === 'dingtalk_sign' ? '钉钉 Webhook 地址' : '接口地址'"
           type="text"
-          :disabled="config.channel !== 'webhook'"
-          placeholder="Webhook 渠道填写接口地址"
+          :disabled="config.channel !== 'webhook' && config.channel !== 'dingtalk_sign'"
+          :placeholder="config.channel === 'dingtalk_sign' ? 'https://oapi.dingtalk.com/robot/send?access_token=...' : 'Webhook 渠道填写接口地址'"
         />
 
         <BaseInput
           v-model="config.token"
-          :label="config.channel === 'feishu' ? 'Webhook 地址 / Token' : 'Token'"
+          :label="config.channel === 'feishu' ? 'Webhook 地址 / Token' : config.channel === 'dingtalk_sign' ? '加签密钥 (SEC...)' : 'Token'"
           type="text"
-          :placeholder="config.channel === 'feishu' ? '飞书机器人 Webhook 地址（https://open.feishu.cn/...）或 token' : '接收端 token'"
+          :placeholder="config.channel === 'dingtalk_sign' ? '钉钉机器人加签密钥，SEC 开头' : config.channel === 'feishu' ? '飞书机器人 Webhook 地址（https://open.feishu.cn/...）或 token' : '接收端 token'"
         />
 
         <div class="grid grid-cols-1 gap-3 md:grid-cols-2">

@@ -51,11 +51,11 @@ async function sendOfflineReminderTest(config) {
   const titleBase = String(config.title || "账号下线提醒").trim();
   const msgBase = String(config.msg || "账号下线").trim();
   if (!channel) return { error: "推送渠道不能为空" };
-  if (channel === "webhook" && !endpoint) {
-    return { error: "Webhook 渠道需要填写接口地址" };
+  if ((channel === "webhook" || channel === "dingtalk_sign") && !endpoint) {
+    return { error: `${channel === "dingtalk_sign" ? "钉钉加签" : "Webhook"} 渠道需要填写接口地址` };
   }
   if (channel !== "webhook" && !token) {
-    return { error: "推送 token 不能为空" };
+    return { error: channel === "dingtalk_sign" ? "钉钉加签密钥不能为空" : "推送 token 不能为空" };
   }
 
   const ts = new Date().toISOString().replace("T", " ").slice(0, 19);
