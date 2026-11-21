@@ -33,7 +33,9 @@ services:
       # CAPTURE_ADVERTISE_IPS=203.0.113.10,198.51.100.20
 
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:3007/api/health"]
+      # 用 127.0.0.1 而非 localhost：容器内 localhost 会解析到 ::1，
+      # 面板只监听 IPv4，导致 healthcheck 误报 unhealthy。
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3007/api/health"]
       interval: 30s
       timeout: 10s
       retries: 3
