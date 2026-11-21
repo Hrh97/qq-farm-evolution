@@ -39,6 +39,25 @@ test('whitelist and steal methods bypass the budget', () => {
     assert.equal(steal.allowed, true);
 });
 
+test('critical low-frequency polls bypass the saturated total budget', () => {
+    governor.resetForTest();
+    // 用偷菜突发把 60s 总预算打满。
+    for (let i = 0; i < governor.TOTAL_LIMIT; i++) {
+        governor.recordSent('gamepb.visitpb.VisitService', 'Enter', true, T0);
+    }
+    // 普通非白名单请求此时应被 budget_total 拦截（对照基线）。
+    const ordinary = governor.checkRequest('svc.Farm', 'DoWork', T0 + 1000);
+    assert.equal(ordinary.allowed, false);
+    assert.equal(ordinary.reason, 'budget_total');
+    // 关键只读巡查即使预算打满也放行，避免被偷菜流量饿死。
+    const taskInfo = governor.checkRequest('gamepb.taskpb.TaskService', 'TaskInfo', T0 + 1000);
+    assert.equal(taskInfo.allowed, true);
+    assert.equal(taskInfo.reason, 'critical_poll');
+    const allLands = governor.checkRequest('gamepb.plantpb.PlantService', 'AllLands', T0 + 1000);
+    assert.equal(allLands.allowed, true);
+    assert.equal(allLands.reason, 'critical_poll');
+});
+
 test('error slowdown never blocks heartbeat or login', () => {
     governor.resetForTest();
     for (let i = 0; i < 15; i++) {

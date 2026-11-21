@@ -36,6 +36,15 @@ const WHITELIST = new Set([
     'gamepb.gatepb.GateService.Login',
     'gamepb.acepb.AceService.AntiData',
 ]);
+// 关键只读巡查：任务检查 / 农场地块检查。它们由调度器低频定时触发，本身
+// 不会形成请求风暴，但会被偷菜突发（enter_steal 单段可达 90/min）挤满的
+// 60s 总预算误伤（budget_total），造成「检查任务失败 / 获取全农场地块失败」
+// 等可见报错。给它们独立的预算豁免：仍照常 recordSent 计入画像（安全巡检
+// 可见），只是不被硬预算丢弃，避免核心巡查被高频抢收饿死。
+const CRITICAL_POLL_METHODS = new Set([
+    'gamepb.taskpb.TaskService.TaskInfo',
+    'gamepb.plantpb.PlantService.AllLands',
+]);
 // 施肥 HOT / 成熟竞速涉及的接口。它们仍计入请求画像，并沿用既有频率门控
 // （Harvest/Steal 的核心链白名单不变）；但短窗口内“别人先偷了/重复离场/
 // 状态刚变化”等预期失败不能累计成整号异常降速。
@@ -128,6 +137,8 @@ function checkRequest(serviceName, methodName, now = Date.now(), options = {}) {
     // 异常阈值只通知上层降低普通巡查节奏，不在这里整号拒绝业务请求。
     // 成熟抢收仍受下面的 60s 总量/单方法硬预算保护。
     if (whitelisted) return { allowed: true, reason: 'whitelist' };
+    // 关键低频只读巡查不受硬预算限制（仍计入画像），避免被偷菜突发饿死。
+    if (CRITICAL_POLL_METHODS.has(key)) return { allowed: true, reason: 'critical_poll' };
 
     // 成熟抢收紧急窗口：偷菜快路径链路请求不被硬预算丢弃（仍计入画像）。
     // 只豁免这五个目标方法，其他请求照常过闸，防止窗口被滥用成全局限流旁路。
