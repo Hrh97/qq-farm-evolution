@@ -65,3 +65,10 @@ test('planting-service.js 买种子/种植优先任务目标', () => {
   assert.ok(src.includes('getTaskSeedTarget(accountId)'), '未接任务目标');
   assert.ok((src.match(/任务优先/g) || []).length >= 2, '商店与背包两条路径都应任务优先');
 });
+
+test('task.js 有周期性兜底领奖重试（防止领奖RPC失败后任务永久卡住）', () => {
+  const fs = require('node:fs');
+  const path = require('node:path');
+  const src = fs.readFileSync(path.join(__dirname, '../src/services/task.js'), 'utf8');
+  assert.ok(src.includes('setIntervalTask(\'task_claim_retry\''), '缺少兜底重试定时器');
+});

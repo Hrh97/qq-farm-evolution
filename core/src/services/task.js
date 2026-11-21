@@ -565,6 +565,11 @@ function initTaskSystem() {
   networkEvents.on('taskInfoNotify', onTaskInfoNotify);
   networkEvents.on('ranchSceneRestored', onRanchSceneRestored);
   taskScheduler.setTimeoutTask('task_init_bootstrap', 15000, checkAndClaimTasks);
+  // 兜底重试：领奖原本只在任务完成瞬间由服务端推送触发一次，若那次 RPC 恰好失败
+  // （农场操作忙 / WS 重连 / 请求被治理器短暂拦截），又没有新推送，任务会永久卡在
+  // "进度满但未领取"。每 90 秒重新扫描一次补领；TaskInfo 已在关键巡查白名单里
+  // 豁免 budget_total，低频轮询不会打满预算。checking 锁 + preventOverlap 防重入。
+  taskScheduler.setIntervalTask('task_claim_retry', 90000, checkAndClaimTasks, { runImmediately: false });
 }
 
 function cleanupTaskSystem() {
