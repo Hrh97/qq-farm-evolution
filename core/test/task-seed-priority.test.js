@@ -8,9 +8,11 @@ const {
   clearTaskSeedTarget,
 } = require('../src/services/task-seed-target');
 
-test('解析"购买N个XX种子"描述', () => {
+test('解析"购买/种植N个XX(种子)"描述', () => {
   assert.deepEqual(parseBuySeedTask('购买8个玉米种子'), { count: 8, cropName: '玉米' });
   assert.deepEqual(parseBuySeedTask('购买 16 个土豆种子'), { count: 16, cropName: '土豆' });
+  assert.deepEqual(parseBuySeedTask('种植8个玉米'), { count: 8, cropName: '玉米' });
+  assert.deepEqual(parseBuySeedTask('种植8个玉米种子'), { count: 8, cropName: '玉米' });
   assert.equal(parseBuySeedTask('完成8次收获'), null);
   assert.equal(parseBuySeedTask('售卖果实获得金币'), null);
   assert.equal(parseBuySeedTask(''), null);

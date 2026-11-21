@@ -17,14 +17,15 @@ function accountKey(_accountId) {
   return STATE_KEY;
 }
 
-/** 从任务描述解析"购买N个XX种子"里的作物名和数量 */
+/** 从任务描述解析"购买/种植N个XX(种子)"里的作物名和数量 */
 function parseBuySeedTask(desc) {
   const text = String(desc || '');
-  // 常见形态："购买8个玉米种子"、"购买 8 个玉米种子"、"购买8个玉米"
-  const m = text.match(/购买\s*(\d+)\s*个\s*([\u4e00-\u9fa5A-Za-z0-9]+?)\s*种子?/);
+  // 形态："购买8个玉米种子"、"种植8个玉米"、"购买 16 个土豆种子"
+  // "种子"后缀可有可无；结尾锚定避免把"种子"两字吞进作物名。
+  const m = text.match(/(?:购买|种植)\s*(\d+)\s*个\s*([\u4e00-\u9fa5A-Za-z0-9]+?)\s*(?:种子)?\s*$/);
   if (!m) return null;
   const count = Number(m[1]);
-  const cropName = String(m[2] || '').trim();
+  let cropName = String(m[2] || '').trim().replace(/种子$/, '');
   if (!Number.isFinite(count) || count <= 0 || !cropName) return null;
   return { count, cropName };
 }
