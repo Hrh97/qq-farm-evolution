@@ -26,6 +26,7 @@ const sendMsgAsync = ownQuietPriority.wrapSend(nativeSendMsgAsync);
 const { types } = require('../utils/proto');
 const { toNum, toLong, toTimeSec, getServerTimeSec, log, logWarn } = require('../utils/utils');
 const { getPlantNameBySeedId, getPlantGrowTime, formatGrowTime, getAllSeeds, getPlantBySeedId, getPlantById } = require('../config/gameConfig');
+const { getTaskSeedTarget } = require('./task-seed-target');
 const {
   getPlantingStrategy,
   getPreferredSeed,
@@ -814,6 +815,20 @@ async function findBestSeed(overrideStrategy, accountId = getCurrentAccountId())
     return null;
   }
 
+  // 「任务优先」：若有未完成的"购买N个XX种子"成长任务，优先买任务指定的种子，
+  // 让任务进度推进；任务完成后目标自动失效，回退原收益策略。
+  const taskTarget = getTaskSeedTarget(accountId);
+  if (taskTarget) {
+    const match = candidates.find(c => c.seedId === taskTarget.seedId);
+    if (match) {
+      log('商店', `任务优先：优先购买「${taskTarget.name}」种子推进成长任务 (${taskTarget.seedId})`, {
+        module: 'warehouse', event: '任务优先选种', result: 'ok',
+        seedId: match.seedId, taskId: taskTarget.taskId, needCount: taskTarget.needCount,
+      });
+      return match;
+    }
+  }
+
   const strategy = overrideStrategy || getPlantingStrategy(accountId);
   const rankingStrategies = {
     max_exp: 'exp',
@@ -905,6 +920,19 @@ async function findBestSeedFromLocal(overrideStrategy, accountId = getCurrentAcc
   if (availableSeeds.length === 0) {
     logWarn('商店', '商店不可用且本地种子库与背包库存未匹配到可种植种子，已跳过本轮自动种植');
     return null;
+  }
+
+  // 「任务优先」：商店不可用但从背包种植时，同样优先任务目标种子（若有库存）
+  const taskTargetLocal = getTaskSeedTarget(accountId);
+  if (taskTargetLocal) {
+    const match = availableSeeds.find(s => s.seedId === taskTargetLocal.seedId
+      && (!s.requiredLevel || s.requiredLevel <= userState.level));
+    if (match) {
+      log('种植', `任务优先：使用背包「${taskTargetLocal.name}」种子推进成长任务`, {
+        module: 'farm', event: '任务优先选种', result: 'ok', seedId: match.seedId,
+      });
+      return match;
+    }
   }
 
   const strategy = overrideStrategy || getPlantingStrategy(accountId);

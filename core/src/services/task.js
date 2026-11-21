@@ -38,6 +38,7 @@ const { toLong, toNum, log, logWarn, sleep } = require('../utils/utils');
 const { createScheduler } = require('./scheduler');
 const { recordOperation } = require('./stats');
 const { getItemById } = require('../config/gameConfig');
+const { registerTaskTarget, clearTaskSeedTarget } = require('./task-seed-target');
 
 // ---- 状态 ----
 
@@ -201,6 +202,30 @@ function formatTask(task, category = 'main') {
       toNum(task.progress) >= toNum(task.total_progress) &&
       toNum(task.total_progress) > 0,
   };
+}
+
+/**
+ * 「任务优先」：把任务列表里的"购买N个XX种子"目标登记到共享状态。
+ * 每轮先清空再登记，任务完成/消失后自动让位收益策略。
+ */
+function syncTaskSeedTargets(taskInfo) {
+  clearTaskSeedTarget();
+  const groups = [
+    ...(taskInfo && taskInfo.growth_tasks ? taskInfo.growth_tasks : []),
+    ...(taskInfo && taskInfo.tasks ? taskInfo.tasks : []),
+  ];
+  for (const t of groups) {
+    const progress = toNum(t && t.progress);
+    const total = toNum(t && t.total_progress);
+    registerTaskTarget({
+      desc: t && t.desc,
+      progress,
+      totalProgress: total,
+      taskId: toNum(t && t.id),
+      isCompleted: total > 0 && progress >= total,
+      isClaimed: !!(t && t.is_claimed),
+    });
+  }
 }
 
 /**
@@ -434,6 +459,9 @@ async function checkAndClaimTasks() {
 
     const taskInfo = reply.task_info;
 
+    // 「任务优先」：同步成长任务里的"购买N个XX种子"目标，供买种子时优先选中。
+    syncTaskSeedTargets(taskInfo);
+
     // 收集可领取任务：三组已格式化候选合并后按任务ID去重（同ID保留首条），
     // 再从去重结果中筛出每日分类，供计数与结果日志使用。
     const dailyTasks = buildDailyTasksForDebug(taskInfo);
@@ -491,6 +519,9 @@ async function checkAndClaimTasks() {
 function onTaskInfoNotify(payload) {
   if (!payload) return;
   if (!isAutomationOn('task')) return;
+
+  // 「任务优先」：推送里也同步一次目标种子，实时性更好
+  syncTaskSeedTargets(payload);
 
   const claimable = uniqueClaimableTasks([
     ...analyzeTaskList(payload.daily_tasks || [], 'daily'),
