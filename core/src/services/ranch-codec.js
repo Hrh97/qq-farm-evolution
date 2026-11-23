@@ -1,6 +1,9 @@
 'use strict';
 
 const protobuf = require('protobufjs');
+const social = require('./ranch-social');
+const handbook = require('./ranch-handbook');
+const cans = require('./ranch-task-cans');
 
 // A separate protobuf root keeps scene 2 wire definitions separate from the farm codec.
 // Proto3 scalar defaults are explicit: absent booleans decode as false, int64
@@ -24,6 +27,28 @@ message AnimalRef {
 message ShelfRef {
     int64 ranch_inst_id = 1;
     int32 slot_index = 2;
+}
+message EnterHomesteadRequest { int64 host_gid = 1; int32 reason = 2; }
+message RanchFriendBasic { int64 gid = 1; string name = 2; }
+message EnterHomesteadReply {
+    RanchFriendBasic basic = 1;
+    bool is_tourist = 6;
+    AllCellsReply homestead_cells = 8;
+}
+message LeaveHomesteadRequest { int64 host_gid = 1; }
+message LeaveHomesteadReply {}
+message GetRanchDetailRequest {
+    int64 host_gid = 1;
+    repeated int64 ranch_inst_ids = 2;
+}
+message GetRanchDetailReply {
+    repeated RanchDetail ranches = 1;
+    int64 interval = 2;
+}
+message StealProduceRequest { int64 host_gid = 1; repeated ShelfRef targets = 2; }
+message StealProduceReply {
+    repeated RanchDetail ranches = 1;
+    repeated FacilityOpResult op_results = 4;
 }
 message RanchDetail {
     int64 ranch_inst_id = 1;
@@ -315,6 +340,13 @@ message GetBagReply {
     int64 curr_grid_num = 4;
     int32 global_scene_id = 5;
 }
+message SellRequest {
+    repeated Item items = 1;
+}
+message SellReply {
+    repeated Item sell_items = 1;
+    repeated Item get_items = 2;
+}
 message SceneData {
     AllCellsReply homestead_cells = 2;
 }
@@ -381,6 +413,52 @@ message BuyGoodsReply {
     repeated Item get_items = 2;   
     repeated Item cost_items = 3;  
 }
+message RanchMallListRequest {
+    int32 slot_type = 1;
+    bool is_manual_open = 2;
+    int32 global_scene_id = 3;
+}
+message RanchMallListReply {
+    repeated RanchMallGoods goods_list = 1;
+}
+message RanchMallGoods {
+    int64 goods_id = 1;
+    string name = 2;
+    int32 goods_type = 3;
+    repeated RanchMallItem reward_items = 4;
+    RanchMallPrice price = 5;
+    bool is_free = 6;
+    RanchMallPurchaseLimit purchase_limit = 7;
+    bool is_available = 8;
+    bool ad_only = 18;
+    bool share_only = 19;
+    bool is_owned = 20;
+}
+message RanchMallItem {
+    int64 id = 1;
+    int64 count = 2;
+}
+message RanchMallPrice {
+    int64 id = 1;
+    optional int64 count = 2;
+}
+message RanchMallPurchaseLimit {
+    int32 type = 1;
+    int64 bought_count = 2;
+    int64 limit_count = 3;
+    bool share_only = 4;
+}
+message RanchMallPurchaseRequest {
+    int64 goods_id = 1;
+    int64 count = 2;
+}
+message RanchMallPurchaseReply {
+    int64 goods_id = 1;
+    bool success = 2;
+    repeated RanchMallItem reward_items = 3;
+    bool is_first_buy = 4;
+    RanchMallPurchaseLimit purchase_limit = 5;
+}
 message Task {
     repeated Item extra_rewards = 14;
     int64 id = 1;                    
@@ -437,11 +515,21 @@ message BatchClaimTaskRewardReply {
     repeated Item items = 1;
     TaskInfo task_info = 2;
     repeated Item compensated_items = 3;
-}`;
+}
+${social.SCHEMA}
+${handbook.SCHEMA}
+${cans.SCHEMA}`;
 const root = protobuf.parse(schema, { keepCase: true }).root;
 root.resolveAll();
 const types = Object.freeze(Object.fromEntries(Object.entries(root.nested).filter(([, value]) => value instanceof protobuf.Type)));
 const ROUTES = Object.freeze({
+    ...social.ROUTES,
+    ...handbook.ROUTES,
+    ...cans.ROUTES,
+    "enterFriend": { service: 'gamepb.visitpb.VisitService', method: 'EnterHomestead', request: 'EnterHomesteadRequest', reply: 'EnterHomesteadReply', writing: false },
+    "leaveFriend": { service: 'gamepb.visitpb.VisitService', method: 'LeaveHomestead', request: 'LeaveHomesteadRequest', reply: 'LeaveHomesteadReply', writing: false },
+    "friendDetail": { service: 'gamepb.animalpb.AnimalService', method: 'GetRanchDetail', request: 'GetRanchDetailRequest', reply: 'GetRanchDetailReply', writing: false },
+    "stealFriend": { service: 'gamepb.animalpb.AnimalService', method: 'StealProduce', request: 'StealProduceRequest', reply: 'StealProduceReply', writing: true },
     "sceneLogin": {
         "service": "gamepb.globalscenepb.GlobalSceneService",
         "method": "PlayerSceneLogin",
@@ -484,6 +572,13 @@ const ROUTES = Object.freeze({
         "reply": "GetBagReply",
         "writing": false
     },
+    "sell": {
+        "service": "gamepb.itempb.ItemService",
+        "method": "Sell",
+        "request": "SellRequest",
+        "reply": "SellReply",
+        "writing": true
+    },
     "shopProfiles": {
         "service": "gamepb.shoppb.ShopService",
         "method": "ShopProfiles",
@@ -497,6 +592,20 @@ const ROUTES = Object.freeze({
         "request": "ShopInfoRequest",
         "reply": "ShopInfoReply",
         "writing": false
+    },
+    "mallGift": {
+        "service": "gamepb.mallpb.MallService",
+        "method": "GetMallListBySlotType",
+        "request": "RanchMallListRequest",
+        "reply": "RanchMallListReply",
+        "writing": false
+    },
+    "claimMallGift": {
+        "service": "gamepb.mallpb.MallService",
+        "method": "Purchase",
+        "request": "RanchMallPurchaseRequest",
+        "reply": "RanchMallPurchaseReply",
+        "writing": true
     },
     "buy": {
         "service": "gamepb.shoppb.ShopService",

@@ -16,6 +16,41 @@ const goods = new Map(manual.goods.map(row => [String(row.id), row]));
 const facilities = new Map(manual.facilities.map(row => [String(row.facility_id), row]));
 const facilityTypes = new Map([[6, 'MODULE_TYPE_RANCH_COOP'], [7, 'MODULE_TYPE_RANCH_SHED'], [8, 'MODULE_TYPE_FEED_MACHINE']]);
 const MAX = (1n << 63n) - 1n;
+const EGG_SALE_TASK = '300006';
+const EGG_ITEM = '1060001';
+const MALL_GIFT_ID = '2001';
+const MALL_GIFT_ITEM = '80021';
+const ranchDay = now => new Date(now + 8 * 3600000).toISOString().slice(0, 10);
+
+function dailyMallLimit(limit, boughtCount) {
+    return limit?.type === 1 && limit.limit_count === '1' && limit.bought_count === boughtCount && limit.share_only === false;
+}
+
+function mallGiftReward(items) {
+    return items?.length === 1 && items[0]?.id === MALL_GIFT_ITEM && items[0].count === '1';
+}
+
+function mallGiftStatus(reply) {
+    const rows = reply?.goods_list?.filter(row => row.goods_id === MALL_GIFT_ID);
+    if (!rows || rows.length > 1) return 'unconfirmed';
+    if (!rows.length) return 'unavailable';
+    const [gift] = rows;
+    const price = gift.price;
+    // An empty Item is the proto3 zero value. A currency without an amount remains unconfirmed.
+    const zeroPrice = price && (price.count === '0' || (price.count === undefined && price.id === '0'));
+    if (gift.is_free !== true || !zeroPrice || price.id.startsWith('-') || gift.ad_only !== false || gift.share_only !== false
+        || !mallGiftReward(gift.reward_items)) return 'unconfirmed';
+    if (dailyMallLimit(gift.purchase_limit, '1')) return 'claimed';
+    if (!dailyMallLimit(gift.purchase_limit, '0')) return 'unconfirmed';
+    return gift.is_available === true && gift.is_owned === false ? 'ready' : 'unavailable';
+}
+
+function mallGiftState(raw) {
+    const live = mallGiftStatus(raw.mallGift);
+    const status = live === 'claimed' || raw.mallGiftOutcome === 'confirmed' ? 'claimed'
+        : raw.mallGiftOutcome ? 'unknown' : live;
+    return { status, reward: itemDto({ id: MALL_GIFT_ITEM, count: '1' }) };
+}
 
 function fail(code, message) {
     throw Object.assign(new Error(message), { code });
@@ -99,6 +134,10 @@ function taskList(reply) {
             rewards: (row.rewards || []).map(itemDto) });
     }
     return [...result.values()];
+}
+
+function eggSaleTask(tasks) {
+    return tasks?.find(row => row.id === EGG_SALE_TASK && row.desc === '出售鸡蛋');
 }
 
 function shopCards(raw, nowMs) {
@@ -234,17 +273,51 @@ function normalizeState(raw, nowMs = Date.now()) {
                     products: (shelf.lots || []).map(lot => itemDto({ id: lot.item_id, count: lot.remain_num })) })),
                 hazards: (ranch.hazards || []).map(hazard => ({ id: positiveId(hazard.hazard_id), type: hazard.hazard_type })) } : null };
     });
+    const physicalItems = new Set(raw.bag.physical_items);
     const inventory = entries.map(item => ({ ...itemDto(item), uid: signedMetadata(item.uid ?? 0, '物品实例标识'), locked: item.is_locked === true || item.locked === true,
         type: items.get(String(item.id))?.type || 0, animalId: cubs.has(String(item.id)) ? String(cubs.get(String(item.id)).id) : null,
         husbandryType: cubs.has(String(item.id)) ? (cubs.get(String(item.id)).husbandry_type === '窝' ? 1 : 2) : null,
-        sellPrices: (item.show?.sells || []).map(itemDto), product: item.item_detail?.ranch_product || null }));
+        sellPrices: (item.show?.sells || []).map(itemDto), canSell: physicalItems.has(item) && salePrices(item).length > 0,
+        product: item.item_detail?.ranch_product || null }));
     return { unlocked: true, sceneId: 2, serverTime: nowMs, level: level?.level ?? null, levelState: level ? 'known' : 'unavailable',
         exp, currentExp: level ? (BigInt(exp) - BigInt(level.exp)).toString() : null,
         neededExp: next && level ? (BigInt(next.exp) - BigInt(level.exp)).toString() : null,
         facilities: ownFacilities, animals: ownFacilities.flatMap(row => row.ranch?.animals || []), inventory, bag: inventory,
         cubs: inventory.filter(item => item.animalId), grass: balance(raw.bag, '7001').available,
         currencies: ['1007', '1002', '1005', '1008', '7002'].map(id => ({ ...itemDto({ id, count: balance(raw.bag, id).total }), ...balance(raw.bag, id) })),
+        ...(raw.mallGift !== undefined && { mallGift: mallGiftState(raw) }),
         shop: shopCards(raw, nowMs), tasks: taskList(raw.tasks), tasksState: raw.tasks ? 'known' : 'unavailable' };
+}
+
+function salePrices(item) {
+    if (![106, 107].includes(items.get(String(item.id))?.type) || item.is_locked || item.locked
+        || item.show?.sell_cond?.length || item.show?.cond_sells?.length || !item.show?.sells?.length
+        || !/^\d+$/.test(String(item.uid)) || BigInt(item.uid) <= 0n || BigInt(item.count) <= 0n) return [];
+    if (!item.show.sells.every(price => BigInt(decimal(price.id)) > 0n && BigInt(decimal(price.count)) > 0n)) return [];
+    return item.show.sells.map(itemDto).sort((a, b) => a.id.localeCompare(b.id) || a.count.localeCompare(b.count));
+}
+
+const AUTO_SALE_BATCH_SIZE = 50;
+
+function automaticSaleItems(state, deferEggs) {
+    if (!Array.isArray(state.tasks)) return [];
+    const eggTask = eggSaleTask(state.tasks);
+    const pending = eggTask?.unlocked && !eggTask.claimed && BigInt(eggTask.total) > BigInt(eggTask.progress);
+    let reservedEggs = pending ? BigInt(eggTask.total) - BigInt(eggTask.progress) : 0n;
+    const selected = [];
+    for (const item of state.inventory) {
+        if (!item.canSell) continue;
+        let count = BigInt(item.count);
+        if (item.id === EGG_ITEM && pending) {
+            if (deferEggs) continue;
+            const reserve = count < reservedEggs ? count : reservedEggs;
+            count -= reserve;
+            reservedEggs -= reserve;
+        }
+        if (count > 0n) selected.push({ uid: item.uid, count: count.toString() });
+        if (selected.length === AUTO_SALE_BATCH_SIZE) break;
+    }
+    return selected;
 }
 
 function selectedFacility(rows, instanceId) {
@@ -257,10 +330,16 @@ function selectedFacility(rows, instanceId) {
 function planAction(action, input = {}, raw, nowMs = Date.now()) {
     const state = normalizeState(raw, nowMs);
     const labels = { buy: '购买牧场商品', place: '放养幼崽', addGrass: '补充牧草', produce: '牧场生产', harvest: '牧场收获', clean: '清理牧场',
-        claimTasks: '领取牧场任务', upgrade: '开始升级', completeUpgrade: '完成升级' };
+        claimTasks: '领取牧场任务', claimMallGift: '领取牧场每日礼包', sell: '出售牧场产物', upgrade: '开始升级', completeUpgrade: '完成升级' };
     if (!labels[action]) fail('INVALID_ARGUMENT', '不支持的牧场操作');
     const plan = { action, label: labels[action], route: action, payload: {}, costItems: [], expectedRewards: [], marker: null, count: 1 };
-    if (action === 'buy') {
+    if (action === 'claimMallGift') {
+        if (Object.keys(input).length) fail('INVALID_ARGUMENT', '每日礼包无需指定商品或数量');
+        if (state.mallGift?.status !== 'ready') fail('RANCH_STATE_CHANGED', '当前没有可领取的牧场每日礼包');
+        plan.payload = { goods_id: MALL_GIFT_ID, count: '1' };
+        plan.expectedRewards = [state.mallGift.reward];
+        plan.mallGiftDay = ranchDay(nowMs);
+    } else if (action === 'buy') {
         if (input.autoPlace === true || input.auto_add === true) fail('INVALID_ARGUMENT', '请先购买入包再放养');
         const shopId = positiveId(input.shopId); const id = positiveId(input.goodsId); const count = positiveCount(input.count);
         const card = state.shop?.shopId === shopId && state.shop.goods.find(row => row.id === id);
@@ -326,6 +405,58 @@ function planAction(action, input = {}, raw, nowMs = Date.now()) {
         plan.payload = { ranch_inst_ids: chosen.map(row => row.id) };
         plan.resultKeys = chosen.flatMap(row => row.ranch.hazards.map(hazard => `${row.id}:3:${hazard.id}`));
         plan.marker = plan.resultKeys; plan.count = plan.resultKeys.length;
+    } else if (action === 'sell') {
+        const physical = raw.bag.physical_items;
+        let selected;
+        if (input.taskId !== undefined) {
+            const task = eggSaleTask(state.tasks);
+            if (String(input.taskId) !== EGG_SALE_TASK || !task?.unlocked || task.claimed || task.canClaim)
+                fail('RANCH_STATE_CHANGED', '出售鸡蛋任务尚未解锁、已完成或已变化');
+            let missing = BigInt(task.total) - BigInt(task.progress);
+            if (missing <= 0n) fail('RANCH_STATE_CHANGED', '出售鸡蛋任务已经完成');
+            selected = [];
+            for (const item of physical) {
+                if (!missing) break;
+                if (String(item.id) !== EGG_ITEM) continue;
+                const prices = salePrices(item);
+                if (!prices.length) continue;
+                const count = BigInt(item.count) < missing ? BigInt(item.count) : missing;
+                selected.push({ item, prices, count: count.toString() });
+                missing -= count;
+            }
+            plan.taskSale = { id: task.id, progress: task.progress, total: task.total,
+                expected: (BigInt(task.total) - missing).toString() };
+            plan.label = '出售鸡蛋任务';
+        } else if (input.autoProducts === true) {
+            const amounts = new Map(automaticSaleItems(state, input.deferEggs === true).map(row => [row.uid, row.count]));
+            selected = physical.filter(item => amounts.has(String(item.uid)))
+                .map(item => ({ item, prices: salePrices(item), count: amounts.get(String(item.uid)) }));
+            plan.productSale = true;
+            plan.label = '出售可售产物';
+        } else if (input.all === true) {
+            selected = physical.map(item => ({ item, prices: salePrices(item), count: String(item.count) }))
+                .filter(row => row.prices.length);
+        } else {
+            const uid = positiveId(input.uid, '物品批次');
+            const count = positiveId(input.count, '出售数量');
+            const itemId = positiveId(input.itemId, '物品');
+            const matches = physical.filter(item => String(item.uid) === uid && String(item.id) === itemId);
+            const prices = matches.length === 1 ? salePrices(matches[0]) : [];
+            if (!prices.length || BigInt(matches[0].count) < BigInt(count)) fail('RANCH_STATE_CHANGED', '产物、可售数量或报价已变化');
+            selected = [{ item: matches[0], prices, count }];
+        }
+        if (!selected.length) fail('RANCH_NO_ELIGIBLE_TARGET', '没有售价已确认的可售产物');
+        const idCounts = new Map();
+        for (const item of physical) {
+            const uid = String(item.uid);
+            idCounts.set(uid, (idCounts.get(uid) || 0) + 1);
+        }
+        if (selected.some(row => idCounts.get(String(row.item.uid)) !== 1)) fail('RANCH_STATE_CHANGED', '牧场产物批次重复，请重新读取背包');
+        selected.sort((a, b) => String(a.item.uid).localeCompare(String(b.item.uid)));
+        plan.payload = { items: selected.map(({ item, count }) => ({ id: positiveId(item.id), uid: positiveId(item.uid), count })) };
+        plan.costItems = plan.payload.items.map(itemDto);
+        plan.expectedRewards = selected.flatMap(({ count, prices }) => prices.map(price => itemDto({ id: price.id, count: BigInt(count) * BigInt(price.count) })));
+        plan.count = selected.length;
     } else if (action === 'claimTasks') {
         if (input.double === true || input.do_shared === true) fail('INVALID_ARGUMENT', '仅支持普通任务奖励');
         if (!state.tasks) fail('RANCH_TASK_UNAVAILABLE', '任务信息不可用');
@@ -347,4 +478,5 @@ function planAction(action, input = {}, raw, nowMs = Date.now()) {
     return plan;
 }
 
-module.exports = { decimal, positiveId, positiveCount, balance, itemDto, normalizeState, planAction, selectedFacility, metadata };
+module.exports = { decimal, positiveId, positiveCount, balance, itemDto, normalizeState, planAction, selectedFacility, metadata, taskList,
+    eggSaleTask, automaticSaleItems, EGG_SALE_TASK, EGG_ITEM, ranchDay, mallGiftStatus, dailyMallLimit, mallGiftReward };

@@ -5,10 +5,12 @@ const CATEGORIES = {
   warehouse: { label: '出售', module: 'warehouse' }, fertilizer: { label: '化肥', module: 'farm' },
   land: { label: '土地', module: 'farm' }, shop: { label: '商城', module: 'warehouse' },
   friend: { label: '好友互动', module: 'friend' }, activity: { label: '活动', module: 'activity' },
+  ranch: { label: '牧场', module: 'ranch' },
   login: { label: '登录维护', module: 'system' },
 };
 const ACTIONS = {
   '领取任务': 'task', '领取活跃奖励': 'task', '图鉴奖励': 'task',
+  ranch_automation_action: 'ranch', dog_skill_gift_claim: 'rewards',
   email_rewards: 'rewards', daily_share: 'rewards', month_card_gift: 'rewards',
   mall_free_gifts: 'rewards', vip_daily_gift: 'rewards',
   '开启化肥礼包': 'fertilizer', '购买化肥': 'fertilizer',
@@ -17,6 +19,7 @@ const ACTIONS = {
   sell_success: 'warehouse', sell_done: 'warehouse',
   '神秘商人自动购买': 'shop', '帮助好友': 'friend', '照顾好友': 'friend', '在线自动捣乱': 'friend',
   '放置黄金虫': 'friend', '自动同意好友': 'friend', milk_tea_operate: 'activity', activity_confirmed: 'activity',
+  muge_reward_claimed: 'activity', muge_task_advanced: 'activity',
 };
 const MILK_ACTIONS = { createShop: '创建店铺', renameShop: '修改店名', hire: '雇佣',
   hireSetting: '调整雇佣设置', claimCashier: '领取营业收益', boost: '加速营业', upgrade: '升级店铺',
@@ -28,6 +31,7 @@ const ACTIVITY_ACTIONS = {
   qingmei_seed: '青梅活动：领取种子', qingmei_wine: '青梅活动：售出青梅酿',
   season_passport: '荷风游记：领取奖励', solar_terms: '节令小札：领取奖励', star_record: '观星礼录：领取奖励',
 };
+const RANCH_FRIEND_ACTIONS = { stealFriend: '自动偷取好友牧场产物', cleanFriend: '自动帮好友清理牧场' };
 // Call only after a positive action is confirmed, never for a query or replay.
 function logActivityAction(action, count) {
   if (!Object.hasOwn(ACTIVITY_ACTIONS, action) || !(Number(count) > 0)) return false;
@@ -38,7 +42,7 @@ function logActivityAction(action, count) {
 }
 const queryTimes = new Map();
 const CONTROL_LABELS = {
-  farm: '农场巡查', harvest: '自动收获', plant: '自动种植', task: '任务领奖', sell: '自动出售',
+  dog_auto_feed: '守卫犬自动喂食', farm: '农场巡查', harvest: '自动收获', plant: '自动种植', task: '任务领奖', sell: '自动出售',
   friend: '好友巡查', friend_steal: '好友偷菜', friend_help: '好友帮助', friend_bad: '好友捣乱',
   friend_golden_bug: '好友黄金虫', friend_help_exp_limit: '帮助经验限制', farm_push: '土地推送响应',
   land_upgrade: '土地升级', golden_bug_clear: '清理黄金虫', fertilizer_gift: '化肥道具填充',
@@ -74,12 +78,22 @@ function actionFromLog(message, meta = {}) {
     : ['task', 'rewards'].includes(category) ? 'task'
       : category === 'fertilizer' ? (['购买化肥', '开启化肥礼包'].includes(event) ? 'warehouse' : 'farm') : category;
   if (meta.module !== expectedModule) return null;
+  if (event === 'ranch_automation_action') {
+    if (meta.result !== 'confirmed' || meta.replayed === true || !Number.isSafeInteger(meta.completed) || meta.completed <= 0) return null;
+    if (Object.hasOwn(RANCH_FRIEND_ACTIONS, meta.action))
+      return { category, message: `${RANCH_FRIEND_ACTIONS[meta.action]}已确认 · ${meta.completed} 项`, level: 'info' };
+    if (!['harvest', 'produce', 'clean', 'claimTasks', 'addGrass', 'buy', 'place'].includes(meta.action)) return null;
+    return { category, message: redactExternalText(String(message || '')).slice(0, 280), level: 'info' };
+  }
+  if (event === 'dog_skill_gift_claim' && (meta.source !== 'automatic' || !(meta.count > 0))) return null;
   if (event === 'sell_done' ? meta.result !== 'unknown_gain'
     : event === '神秘商人自动购买' ? meta.result !== 'success'
       : event === 'milk_tea_operate' ? !(meta.result === 'ok' || (meta.action === 'interact' && meta.result === 'gameplay_lose'))
         : meta.result !== 'ok') return null;
   if (event === 'activity_confirmed' && (!Object.hasOwn(ACTIVITY_ACTIONS, meta.action)
     || !(Number(meta.count) > 0) || meta.replayed === true)) return null;
+  if (['muge_reward_claimed', 'muge_task_advanced'].includes(event)
+    && (!Number.isSafeInteger(meta.count) || meta.count <= 0 || meta.replayed === true)) return null;
   if (event === 'vip_daily_gift' && (!Array.isArray(meta.vipTypes) || !meta.vipTypes.length)) return null;
   if (event === '购买化肥' && meta.automationAction !== true) return null;
   if (['开启化肥礼包', '购买化肥', '施肥', '常规施肥', '多季节施肥', '放置黄金虫', '自动同意好友', 'email_rewards', 'mall_free_gifts', '领取活跃奖励', '神秘商人自动购买'].includes(event)

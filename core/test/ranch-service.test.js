@@ -10,9 +10,11 @@ assert.ok(temp !== repo && !temp.startsWith(repo + path.sep));
 const prefix = path.resolve(temp, 'farm-ranch-service-');
 assert.equal(path.dirname(prefix), temp);
 const root = fs.mkdtempSync(prefix);
+assert.equal(fs.realpathSync(root), root);
 function fixturePath(name) {
   const target = path.resolve(root, name);
   assert.equal(path.dirname(target), root);
+  assert.equal(fs.existsSync(target), false);
   return target;
 }
 process.env.FARM_DATA_DIR = root;
@@ -22,12 +24,22 @@ process.env.FARM_SESSION_LOG_DIR = fixturePath('session-logs');
 const codec = require('../src/services/ranch-codec');
 const { encode, decode } = require('../src/runtime/session-codec');
 const { createRanchService } = require('../src/services/ranch-service');
-test.after(() => fs.rmSync(root, { recursive: true, force: true }));
+const { createGameSceneCoordinator } = require('../src/runtime/game-scene-coordinator');
+test.after(() => {
+  // Run after the daily-feedback exit flush, which can otherwise recreate the fixture directory.
+  process.once('exit', () => {
+    assert.equal(fs.realpathSync(root), root);
+    fs.rmSync(root, { recursive: true, force: true });
+    assert.equal(fs.existsSync(root), false);
+  });
+});
 function fixture(upgrade = false) {
   const file = fixturePath(`operations-${Math.random().toString(16).slice(2)}.json`);
   let now = 1800000000000; let gameOffset = 0; let allowed = true; let failure = false; let malformed = false;
-  let gold = upgrade ? 50000 : 100; let price = 10; let grass = 50; let cubs = 5; let writes = 0;
-  const calls = []; const ws = {}; let beforeWrite;
+  let gold = upgrade ? 50000 : 100; let price = 10; let grass = 50; let writes = 0;
+  let nextAnimal = 8;
+  const cubs = new Map();
+  const calls = []; const leases = []; const ws = {}; let beforeWrite;
   const facilities = [
     { instance_id: '11', facility_id: 6001002, module_type: 6, state: 1, level: 2, capacity: 4,
       ranch: { ranch_inst_id: '11', capacity: 4, animal_count: 1, husbandry_type: 1,
@@ -40,7 +52,9 @@ function fixture(upgrade = false) {
   }
   const network = {
     getWs: () => ws, isConnected: () => true, getUserState: () => ({ gid: 42 }),
-    withRanchScene: async callback => {
+    withRanchScene: async (callback, options) => {
+      leases.push(options.maxCalls);
+      if (f.realScene) return scene.run(callback, options);
       const value = await callback({ initial: f.initial, assertCurrent() {} });
       now += f.restoreDelayMs || 0;
       return value;
@@ -50,17 +64,44 @@ function fixture(upgrade = false) {
       if (f.onRead) await f.onRead(method);
       const route = Object.values(codec.ROUTES).find(x => x.method === method && x.service === service);
       const request = codec.decode(route.request, wire); let reply;
-      if (method === 'AllCells') reply = { grid_width: 10, grid_height: 10, facilities: malformed && writes ? [{ ...facilities[0], instance_id: '0' }] : facilities };
-      else if (method === 'GetBag') reply = { global_scene_id: 2, physical_items: [{ id: '60001', count: String(cubs) }, { id: '7001', count: String(grass) }], virtual_items: [{ id: '1007', count: String(gold) }, ...(upgrade ? [{ id: '1102', count: '40000' }] : [])] };
+      if (method === 'PlayerSceneLogin') {
+        const id = request.global_scene_id;
+        reply = { global_scene_id: id, ...(id === 2
+          ? { big_farm_scene_ext_data: codec.encode('SceneData', { homestead_cells: { grid_width: 10, grid_height: 10, facilities } }) }
+          : { farm_scene_ext_data: Buffer.from([1]) }) };
+      } else if (method === 'AllCells') reply = { grid_width: 10, grid_height: 10, facilities: malformed && writes ? [{ ...facilities[0], instance_id: '0' }] : facilities };
+      else if (method === 'GetBag') reply = { global_scene_id: 2,
+        physical_items: [{ id: '7001', count: String(grass) }, ...[...cubs].map(([id, count]) => ({ id, count: String(count) })), ...f.lockedCubs, ...f.products.filter(row => BigInt(row.count) > 0n)],
+        virtual_items: [{ id: '1007', count: String(gold) }, ...(upgrade ? [{ id: '1102', count: '40000' }] : [])] };
       else if (method === 'GetFacilityDetail') {
         const facility = facilities[0]; assert.equal(request.instance_id, facility.instance_id);
         reply = { info: { instance_id: facility.instance_id, facility_id: facility.facility_id, module_type: facility.module_type,
           level: facility.level, upgrade_cost: [{ id: '1007', count: String(f.upgradeCost) }] } };
       }
-      else if (method === 'ShopProfiles') reply = { shop_profiles: [{ shop_id: 5, global_scene_ids: [2] }] };
-      else if (method === 'ShopInfo') reply = { goods_list: [{ id: '10002', item_id: '60001', item_count: '1', price: String(price), unlocked: true }] };
-      else if (method === 'TaskInfo') reply = { task_info: { growth_tasks: [] } };
-      else {
+      else if (method === 'ShopProfiles') reply = { shop_profiles: [5, 6].map(shop_id => ({ shop_id, global_scene_ids: [2] })) };
+      else if (method === 'ShopInfo') reply = { goods_list: f.goods() };
+      else if (method === 'GetMallListBySlotType') {
+        assert.equal(request.slot_type, 6);
+        assert.equal(request.global_scene_id, 2);
+        f.mallOpens.push(request.is_manual_open);
+        reply = { goods_list: f.mallGoods };
+      }
+      else if (method === 'TaskInfo') reply = { task_info: { growth_tasks: f.tasks } };
+      else if (method === 'EnterHomestead') {
+        assert.ok(f.friendHosts.includes(request.host_gid));
+        assert.equal(request.reason, 2);
+        f.friendVisits.push(request.host_gid);
+        reply = { basic: { gid: request.host_gid, name: '测试好友' }, is_tourist: f.tourist === true,
+          homestead_cells: { facilities: [{ instance_id: '51' }] } };
+      } else if (method === 'GetRanchDetail') {
+        assert.ok(f.friendHosts.includes(request.host_gid));
+        reply = { ranches: f.friendRanches };
+      } else if (method === 'GetRanchOpTimes') {
+        reply = { ops: [{ op_id: '11009', times_limit: '2', used_times: '0', remaining_times: '2' }] };
+      } else if (method === 'LeaveHomestead') {
+        assert.ok(f.friendHosts.includes(request.host_gid));
+        reply = {};
+      } else {
         if (f.queueFull) throw decode(encode(Object.assign(new Error('synthetic request queue full'), { isLocalRequestRejection: true })));
         if (f.rejectUnsent) throw Object.assign(new Error('synthetic budget rejection'), { isGovernedRejection: true });
         beforeWrite?.(); writes++;
@@ -75,22 +116,77 @@ function fixture(upgrade = false) {
           facilities[0].ranch.capacity = 4;
           reply = { facility: facilities[0], item: { inst_id: request.inst_id, facility_id: 6001002, level: 2 } };
         } else if (method === 'BuyGoods') {
-          const count = Number(request.num); gold -= price * count; cubs += count;
-          reply = { goods: { id: '10002' }, cost_items: [{ id: '1007', count: String(price * count) }], get_items: [{ id: '60001', count: String(count) }] };
+          const good = f.goods().find(row => row.id === request.goods_id);
+          const count = Number(request.num);
+          const cost = Number(request.price) * count;
+          const quantity = Number(good.item_count) * count;
+          gold -= cost;
+          cubs.set(good.item_id, (cubs.get(good.item_id) || 0) + quantity);
+          if (good.limit_count) good.bought_num = String(Number(good.bought_num ?? 0) + count);
+          reply = { goods: { id: good.id }, cost_items: [{ id: '1007', count: String(cost) }], get_items: [{ id: good.item_id, count: String(quantity) }] };
+        } else if (method === 'Purchase') {
+          assert.deepEqual(request, { goods_id: '2001', count: '1' });
+          reply = { goods_id: '2001', success: true, reward_items: [{ id: '80021', count: '1' }],
+            purchase_limit: { type: 1, bought_count: '1', limit_count: '1' } };
+          if (!f.keepMallCatalogStale) f.mallGoods[0].purchase_limit.bought_count = '1';
+        } else if (method === 'Sell') {
+          const earned = new Map();
+          for (const stack of request.items) {
+            const original = f.products.find(row => row.id === stack.id && row.uid === stack.uid);
+            assert.ok(original);
+            original.count = (BigInt(original.count) - BigInt(stack.count)).toString();
+            for (const price of original.show.sells) earned.set(price.id, (earned.get(price.id) || 0n) + BigInt(price.count) * BigInt(stack.count));
+          }
+          reply = { sell_items: request.items.map(({ id, uid, count }) => ({ id, uid, count })),
+            get_items: [...earned].map(([id, count]) => ({ id, count: count.toString() })) };
+        } else if (method === 'StrokeAnimal') {
+          const room = f.friendRanches[0];
+          const animal = room.animals.find(row => row.animal_inst_id === request.target.animal_inst_id);
+          assert.ok(animal);
+          animal.mutation.stroked_gids = ['42'];
+          reply = { ranches: [room], op_result: { facility_inst_id: room.ranch_inst_id, kind: 1, target_id: String(animal.animal_inst_id) },
+            remaining_times: '1' };
+        } else if (method === 'StealProduce') {
+          assert.ok(f.friendHosts.includes(request.host_gid));
+          assert.deepEqual(request.targets, [{ ranch_inst_id: '51', slot_index: 0 }]);
+          reply = { op_results: [{ facility_inst_id: '51', kind: 2, target_id: '0', rewards: [{ id: '1060001', count: '1' }] }] };
+        } else if (method === 'CleanAllRanch' && f.friendHosts.includes(request.host_gid)) {
+          assert.deepEqual(request.ranch_inst_ids, ['51']);
+          reply = { op_results: [{ facility_inst_id: '51', kind: 3, target_id: '2' }] };
         } else if (method === 'AddFeed') { grass -= request.add_count; reply = { consumed: [{ id: '7001', count: String(request.add_count) }] }; }
         else if (method === 'PlaceAnimal') {
-          cubs -= request.items.length;
-          for (let n = 0; n < request.items.length; n++) facilities[0].ranch.animals.push({ animal_inst_id: 8 + n, animal_id: '60001', ranch_inst_id: '11' });
-          reply = { op_results: request.items.map((_x, i) => ({ facility_inst_id: '11', kind: 1, target_id: String(i + 8) })) };
+          reply = { op_results: request.items.map(({ ranch_inst_id, animal_id }) => {
+            const room = facilities.find(row => row.instance_id === ranch_inst_id).ranch;
+            const animal_inst_id = nextAnimal++;
+            cubs.set(animal_id, cubs.get(animal_id) - 1);
+            room.animals.push({ ranch_inst_id, animal_id, animal_inst_id });
+            room.animal_count++;
+            return { facility_inst_id: ranch_inst_id, kind: 1, target_id: String(animal_inst_id) };
+          }) };
         } else reply = { op_results: [{ facility_inst_id: '11', kind: 1, target_id: '7' }] };
       }
       if (route.writing && f.mutateReply) reply = f.mutateReply(reply);
       return { body: codec.encode(route.reply, reply) };
     },
   };
-  const make = () => createRanchService({ network, file: () => file, now: () => now + gameOffset, quoteNow: () => now, canAutomate: () => allowed });
-  const f = { service: make(), make, calls, file, upgradeCost: 14000, get writes() { return writes; }, advance: ms => { now += ms; }, correctGameClock: ms => { gameOffset = ms; },
-    price: n => { price = n; }, timeout: () => { failure = true; }, malformed: () => { malformed = true; },
+  const send = network.sendMsgAsync;
+  const scene = createGameSceneCoordinator({
+    identity: () => ({ key: 'ranch-fixture', connected: true, level: 30 }),
+    priority: () => f.farmPriority === true,
+    profile: () => ({ totalLimit: 80, perMethodLimit: 30, windowCount: 0, top: [] }),
+    encodeScene: id => codec.encode('PlayerSceneLoginRequest', { global_scene_id: id }),
+    decodeScene: body => codec.decode('PlayerSceneLoginReply', body),
+    send,
+  });
+  network.sendMsgAsync = (...args) => f.realScene ? scene.send(...args) : send(...args);
+  const make = () => createRanchService({ network, file: () => file, now: () => now + gameOffset, quoteNow: () => now, canAutomate: () => allowed,
+    getFriendTargets: () => { if (f.rosterError) throw f.rosterError; return f.friendRoster; },
+    canVisitFriend: gid => !f.friendQuiet && !f.blockedFriends.includes(gid) });
+  const f = { service: make(), make, calls, leases, scene, file, cubs, facilities, lockedCubs: [], products: [], tasks: [], friendRanches: [], upgradeCost: 14000,
+    mallGoods: [], mallOpens: [],
+    friendHosts: ['73'], friendVisits: [], friendRoster: [], blockedFriends: [],
+    goods: () => [{ id: '10002', item_id: '60001', item_count: '1', price: String(price), unlocked: true }], get writes() { return writes; }, advance: ms => { now += ms; }, correctGameClock: ms => { gameOffset = ms; },
+    price: n => { price = n; }, gold: n => { gold = n; }, timeout: () => { failure = true; }, malformed: () => { malformed = true; },
     allow: value => { allowed = value; }, beforeWrite: fn => { beforeWrite = fn; } };
   return f;
 }
@@ -98,6 +194,427 @@ async function quoteBuy(f) {
   const result = await f.service.prepare('buy', { shopId: '5', goodsId: '10002', count: 1 });
   assert.equal(result.ok, true, JSON.stringify(result)); return result.data.id;
 }
+
+async function setOnlyAutomation(f, flags) {
+  const { data: { policy } } = await f.service.getAutomation();
+  const result = await f.service.setAutomation({ ...policy, harvest: false, produce: false, clean: false, tasks: false, enabled: true, ...flags });
+  assert.equal(result.ok, true, result.error);
+  f.advance(31000);
+}
+
+function dailyMallGift(overrides = {}) {
+  return { goods_id: '2001', is_free: true, is_available: true, price: { count: '0' },
+    reward_items: [{ id: '80021', count: '1' }], purchase_limit: { type: 1, bought_count: '0', limit_count: '1' }, ...overrides };
+}
+
+test('牧场每日礼包手动领取验证槽位、预检、实际回执和当天去重', async () => {
+  const f = fixture();
+  f.mallGoods = [dailyMallGift()];
+  f.keepMallCatalogStale = true;
+  f.realScene = true;
+  const state = await f.service.getState('mallGift');
+  assert.deepEqual(state.data.mallGift, { status: 'ready', reward: { id: '80021', count: '1', name: '无机罐头（1小时）' } });
+  assert.deepEqual(f.mallOpens, [true]);
+  const prepared = await f.service.prepare('claimMallGift');
+  assert.equal(prepared.ok, true, prepared.error);
+  assert.deepEqual(prepared.data.costItems, []);
+  assert.equal(f.writes, 0);
+  const result = await f.service.execute(prepared.data.id);
+  assert.equal(result.data.outcome, 'confirmed');
+  assert.equal(result.data.snapshot.mallGift.status, 'claimed');
+  assert.deepEqual(result.data.rewards, prepared.data.expectedRewards);
+  assert.deepEqual(f.mallOpens, [true, false, false, false]);
+  const replacement = f.make();
+  assert.equal((await replacement.getState('mallGift')).data.mallGift.status, 'claimed');
+  assert.equal((await replacement.execute(prepared.data.id)).data.replayed, true);
+  assert.equal((await replacement.prepare('claimMallGift')).code, 'RANCH_STATE_CHANGED');
+  assert.equal(f.writes, 1);
+  f.advance(86400000);
+  assert.equal((await replacement.getState('mallGift')).data.mallGift.status, 'ready');
+});
+
+test('牧场礼包写前拦截收费、广告、分享、已购和未知配置', async () => {
+  const f = fixture();
+  for (const override of [
+    { goods_id: '2002' }, { is_free: false }, { price: undefined }, { price: { count: '1' } },
+    { ad_only: true }, { share_only: true }, { is_owned: true }, { is_available: false },
+    { purchase_limit: { type: 4, bought_count: '0', limit_count: '1' } },
+    { purchase_limit: { type: 1, bought_count: '0', limit_count: '1', share_only: true } },
+    { purchase_limit: { type: 1, bought_count: '1', limit_count: '1' } },
+    { reward_items: [{ id: '80021', count: '2' }] },
+  ]) {
+    f.mallGoods = [dailyMallGift()];
+    const prepared = await f.service.prepare('claimMallGift');
+    assert.equal(prepared.ok, true);
+    const changed = dailyMallGift(override);
+    if (override.price === undefined && Object.hasOwn(override, 'price')) delete changed.price;
+    f.mallGoods = [changed];
+    const result = await f.service.execute(prepared.data.id);
+    assert.equal(result.code, 'RANCH_STATE_CHANGED');
+  }
+  f.mallGoods = [dailyMallGift(), dailyMallGift()];
+  assert.equal((await f.service.prepare('claimMallGift')).code, 'RANCH_STATE_CHANGED');
+  assert.equal(f.writes, 0);
+});
+
+test('牧场礼包严格检查回执，商城限购可确认领取状态但不报告未经证明的到账', async () => {
+  const f = fixture();
+  f.mallGoods = [dailyMallGift()];
+  f.mutateReply = reply => ({ ...reply, success: false });
+  const { data: quote } = await f.service.prepare('claimMallGift');
+  const { data: result } = await f.service.execute(quote.id);
+  assert.equal(result.outcome, 'unknown');
+  assert.equal(result.snapshot.mallGift.status, 'claimed');
+  assert.equal(result.rewards, undefined);
+  const state = await f.make().getState('mallGift');
+  assert.equal(state.data.lastOperation.outcome, 'acknowledged');
+  assert.deepEqual(state.data.lastOperation.rewards, []);
+  assert.equal((await f.make().prepare('claimMallGift')).code, 'RANCH_STATE_CHANGED');
+  assert.equal(f.writes, 1);
+});
+
+test('超时后只核对商城，同日手工核对可恢复其他操作但不会再发礼包领取', async () => {
+  const f = fixture();
+  f.mallGoods = [dailyMallGift()];
+  f.timeout();
+  const { data: quote } = await f.service.prepare('claimMallGift');
+  assert.equal((await f.service.execute(quote.id)).data.outcome, 'unknown');
+  const replacement = f.make();
+  await replacement.getState('animals');
+  assert.equal((await replacement.acknowledge(quote.id)).code, 'RANCH_REFRESH_REQUIRED');
+  const state = await replacement.getState('mallGift');
+  assert.equal(state.data.mallGift.status, 'unknown');
+  assert.equal((await replacement.acknowledge(quote.id)).data.outcome, 'acknowledged');
+  assert.equal((await replacement.prepare('claimMallGift')).code, 'RANCH_STATE_CHANGED');
+  assert.equal((await replacement.execute(quote.id)).data.replayed, true);
+  assert.equal(f.writes, 1);
+});
+
+test('礼包回执超时后自动流程只读，多次查询仍不会再次领取', async () => {
+  const f = fixture();
+  f.mallGoods = [dailyMallGift()];
+  await setOnlyAutomation(f, { mallGift: true });
+  f.timeout();
+  assert.equal((await f.service.automate()).data.outcome, 'unknown');
+  const replacement = f.make();
+  f.advance(31000);
+  assert.equal((await replacement.automate()).data.skipped, true);
+  assert.equal((await replacement.getState('mallGift')).data.lastOperation.outcome, 'unknown');
+  f.mallGoods[0].purchase_limit.bought_count = '1';
+  f.advance(31000);
+  assert.equal((await replacement.automate()).data.skipped, true);
+  assert.equal((await replacement.getState('mallGift')).data.lastOperation.outcome, 'acknowledged');
+  assert.equal(f.writes, 1);
+});
+
+test('牧场礼包跨日重新确认，明确未发出才可在同一天重试', async () => {
+  const f = fixture();
+  f.mallGoods = [dailyMallGift()];
+  const { data: previousDay } = await f.service.prepare('claimMallGift');
+  f.correctGameClock(86400000);
+  assert.equal((await f.service.execute(previousDay.id)).code, 'RANCH_STATE_CHANGED');
+  assert.equal(f.writes, 0);
+  const { data: newDay } = await f.service.prepare('claimMallGift');
+  f.rejectUnsent = true;
+  assert.equal((await f.service.execute(newDay.id)).data.outcome, 'not_sent');
+  assert.equal((await f.service.getState('mallGift')).data.mallGift.status, 'ready');
+  f.rejectUnsent = false;
+  const { data: retry } = await f.service.prepare('claimMallGift');
+  assert.equal((await f.service.execute(retry.id)).data.outcome, 'confirmed');
+  assert.equal(f.writes, 1);
+});
+
+test('自动领取每日礼包默认关闭，尊重账号暂停、手动确认和同日去重', async () => {
+  const f = fixture();
+  f.mallGoods = [dailyMallGift()];
+  assert.equal((await f.service.getAutomation()).data.policy.mallGift, false);
+  await setOnlyAutomation(f, {});
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.deepEqual(f.mallOpens, []);
+  await setOnlyAutomation(f, { mallGift: true });
+  f.allow(false);
+  assert.equal((await f.service.automate()).data.skipped, true);
+  f.allow(true);
+  const manual = await f.service.prepare('claimMallGift');
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.equal(f.writes, 0);
+  await f.service.cancel(manual.data.id);
+  assert.equal((await f.service.automate()).data.outcome, 'confirmed');
+  assert.ok(f.mallOpens.every(value => value === false));
+  f.advance(300001);
+  const calls = f.mallOpens.length;
+  assert.equal((await f.make().automate()).data.skipped, true);
+  assert.equal(f.mallOpens.length, calls);
+  assert.equal(f.writes, 1);
+});
+
+function saleStack(uid, itemId, count, extra = {}) {
+  return { uid, id: itemId, count: String(count), show: { sells: [{ id: '1002', count: '5' }] }, ...extra };
+}
+
+test('automatic ranch sale keeps the egg task gap and skips locked or conditionally priced stacks', async () => {
+  const f = fixture();
+  f.tasks.push({ id: '300006', desc: '出售鸡蛋', progress: '1', total_progress: '3', task_type: 4, is_unlocked: true });
+  f.products.push(saleStack('101', '1060001', 6), saleStack('102', '1060002', 3), saleStack('103', '1060001', 4, { is_locked: true }),
+    saleStack('104', '1060003', 2, { show: { sells: [{ id: '1002', count: '5' }], sell_cond: [{ type: 'fixture' }] } }));
+  await setOnlyAutomation(f, { sellProducts: true });
+  const result = await f.service.automate();
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.data.outcome, 'confirmed');
+  assert.deepEqual(f.products.map(row => row.count), ['2', '0', '4', '2']);
+  assert.equal(f.writes, 1);
+  assert.equal((await f.service.getAutomation()).data.usage['sell:1060002'], '3');
+  f.advance(300001);
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.equal(f.writes, 1);
+});
+
+test('manual confirmation owns sales and a confirmed harvest schedules an earlier product sale', async () => {
+  const f = fixture();
+  await setOnlyAutomation(f, { harvest: true, sellProducts: true });
+  f.beforeWrite(() => {
+    if (f.writes === 0) f.products.push(saleStack('101', '1060002', 3));
+  });
+  assert.equal((await f.service.automate()).data.action, 'harvest');
+  const manual = await f.service.prepare('sell', { all: true });
+  assert.equal(manual.ok, true, manual.error);
+  f.advance(31000);
+  assert.equal((await f.service.automate()).data.action, 'harvest');
+  assert.equal(f.products[0].count, '3');
+  assert.equal(f.calls.includes('Sell'), false);
+  assert.equal((await f.service.cancel(manual.data.id)).data.cancelled, true);
+  f.advance(300001);
+  const result = await f.service.automate();
+  assert.equal(result.data.action, 'sell');
+  assert.equal(result.data.outcome, 'confirmed');
+  assert.equal(f.products[0].count, '0');
+});
+
+test('the egg task owns its current gap before the surplus sale while both rules are enabled', async () => {
+  const f = fixture();
+  const task = { id: '300006', desc: '出售鸡蛋', progress: '1', total_progress: '3', task_type: 4, is_unlocked: true };
+  f.tasks.push(task);
+  f.products.push(saleStack('101', '1060001', 6), saleStack('102', '1060002', 3));
+  await setOnlyAutomation(f, { eggSale: true, sellProducts: true });
+  f.beforeWrite(() => { task.progress = '3'; });
+  const taskSale = await f.service.automate();
+  assert.equal(taskSale.data.label, '出售鸡蛋任务');
+  assert.equal(taskSale.data.outcome, 'confirmed');
+  assert.deepEqual(f.products.map(row => row.count), ['4', '3']);
+  f.advance(300001);
+  const surplusSale = await f.service.automate();
+  assert.equal(surplusSale.data.label, '出售可售产物');
+  assert.equal(surplusSale.data.outcome, 'confirmed');
+  assert.deepEqual(f.products.map(row => row.count), ['0', '0']);
+  assert.equal(f.writes, 2);
+});
+
+test('automatic friend ranch runs on its own interval and executes both actions during one visit', async () => {
+  const f = fixture();
+  f.realScene = true;
+  f.friendHosts.push('74');
+  f.friendRoster.push({ gid: '73' }, { gid: '74' }, { gid: '42' }, { gid: '75' }, { gid: null });
+  f.blockedFriends.push('75');
+  f.friendRanches.push({ ranch_inst_id: '51', shelves: [
+    { slot_index: 0, can_steal: true, lots: [{ item_id: '1060001', can_steal: true, remain_num: '2' }] },
+  ], hazards: [{ hazard_id: '2', owner: '50', hazard_type: 1 }] });
+  await setOnlyAutomation(f, { friendSteal: true, friendClean: true, harvest: true, produce: true, clean: true, tasks: true, intervalMinutes: 2 });
+  f.friendQuiet = true;
+  assert.equal((await f.service.automate()).data.action, 'harvest');
+  assert.deepEqual(f.friendVisits, []);
+  f.calls.length = 0;
+  f.friendQuiet = false;
+  f.advance(30000);
+  for (const gid of ['73', '74']) {
+    const before = f.calls.length;
+    const result = await f.service.automate();
+    assert.equal(result.ok, true, result.error);
+    assert.deepEqual(result.data.results.map(row => [row.action, row.friendGid, row.outcome]),
+      [['stealFriend', gid, 'confirmed'], ['cleanFriend', gid, 'confirmed']]);
+    assert.deepEqual(f.calls.slice(before), ['PlayerSceneLogin', 'EnterHomestead', 'GetRanchDetail',
+      'StealProduce', 'CleanAllRanch', 'LeaveHomestead', 'PlayerSceneLogin']);
+    assert.equal(f.scene.snapshot().scene, 1);
+    if (gid === '73') {
+      f.advance(90001);
+      assert.equal((await f.service.automate()).data.action, 'produce');
+      f.advance(30000);
+    }
+  }
+  assert.deepEqual(f.friendVisits, ['73', '74']);
+  assert.equal(f.writes, 6);
+});
+
+test('the own ranch rotation shares a two-minute setting across enabled slots with one turn per worker tick', async () => {
+  const f = fixture();
+  Object.assign(f.facilities[0].ranch.animals[0], { can_harvest: false, can_deliver: false });
+  await setOnlyAutomation(f, { harvest: true, produce: true, clean: true, tasks: true, eggSale: true,
+    sellProducts: true, stockCoop: true, stockShed: true, buyMissingCubs: false, intervalMinutes: 2 });
+  for (const cursor of [11, 12, 1, 2, 3, 4, 8, 9]) {
+    const before = f.calls.length;
+    assert.equal((await f.service.automate()).data.skipped, true);
+    assert.equal((await f.service.getAutomation()).data.cursor, cursor);
+    assert.ok(f.calls.length > before);
+    const after = f.calls.length;
+    f.advance(29999);
+    assert.equal((await f.service.automate()).data.skipped, true);
+    assert.equal(f.calls.length, after);
+    f.advance(1);
+  }
+  assert.equal(f.writes, 0);
+});
+
+test('automatic friend ranch keeps prepared manual work and a newly blacklisted target from dispatching', async () => {
+  const f = fixture();
+  f.friendRoster.push({ gid: '73' });
+  f.friendRanches.push({ ranch_inst_id: '51', shelves: [
+    { slot_index: 0, can_steal: true, lots: [{ item_id: '1060001', can_steal: true, remain_num: '2' }] },
+  ] });
+  await setOnlyAutomation(f, { friendSteal: true });
+  const manual = await f.service.prepare('stealFriend', { hostGid: '73' });
+  assert.equal(manual.ok, true);
+  const before = f.calls.length;
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.equal(f.calls.length, before);
+  await f.service.cancel(manual.data.id);
+  f.onRead = method => {
+    if (method === 'GetRanchDetail') f.blockedFriends.push('73');
+  };
+  assert.equal((await f.service.automate()).code, 'RANCH_AUTOMATION_PAUSED');
+  assert.equal(f.writes, 0);
+});
+
+test('handbook care visits one real scene, prefers an eligible duck, and verifies the actor and quota in the receipt', async () => {
+  const f = fixture();
+  f.realScene = true;
+  f.friendRoster.push({ gid: '73' });
+  f.friendRanches.push({ ranch_inst_id: '51', husbandry_type: 1, animals: [
+    { animal_inst_id: 2, animal_id: '60001', ranch_inst_id: '51', mutation: { strokable: true } },
+    { animal_inst_id: 3, animal_id: '60002', ranch_inst_id: '51', mutation: { strokable: true } },
+  ] });
+  assert.equal((await f.service.prepare('careFriend', { hostGid: '73' })).code, 'RANCH_INVALID_ARGUMENT');
+  const result = await f.service.runFriendTask('careFriend', 0, () => true);
+  assert.equal(result.ok, true, result.error);
+  assert.equal(result.data.outcome, 'confirmed');
+  assert.deepEqual(f.friendRanches[0].animals[1].mutation.stroked_gids, ['42']);
+  assert.deepEqual(f.calls, ['PlayerSceneLogin', 'EnterHomestead', 'GetRanchDetail', 'GetRanchOpTimes',
+    'StrokeAnimal', 'LeaveHomestead', 'PlayerSceneLogin']);
+  assert.equal(f.scene.snapshot().scene, 1);
+});
+
+test('handbook stocking obeys the task gap, uses inventory, and leaves the payment shop untouched', async () => {
+  const f = fixture();
+  f.realScene = true;
+  f.cubs.set('60001', 3);
+  const result = await f.service.runOwnTask('stockAnimals', 2, () => true);
+  assert.equal(result.data.outcome, 'confirmed', result.data.message);
+  assert.equal(result.data.completed, 2);
+  assert.equal(f.cubs.get('60001'), 1);
+  assert.equal(f.calls.includes('ShopInfo'), false);
+  assert.equal(f.scene.snapshot().scene, 1);
+});
+
+test('an empty steal shelf still lets the same visit clean and a failed roster is reported separately', async t => {
+  const records = ranchLogs(t);
+  const f = fixture();
+  f.friendRoster.push({ gid: '73', name: '测试好友' });
+  f.friendRanches.push({ ranch_inst_id: '51', hazards: [{ hazard_id: '2', owner: '50', hazard_type: 1 }] });
+  await setOnlyAutomation(f, { friendSteal: true, friendClean: true, intervalMinutes: 2 });
+  f.rosterError = new Error('upstream fixture');
+  assert.equal((await f.service.automate()).failureStage, 'friendRoster');
+  assert.deepEqual(f.calls, []);
+  assert.deepEqual(records.filter(row => row.meta.reason === 'read_failed').map(row => [row.meta.action, row.meta.failureStage]),
+    [['stealFriend', 'friendRoster'], ['cleanFriend', 'friendRoster']]);
+  f.rosterError = null;
+  f.advance(120001);
+  const scan = await f.service.automate();
+  assert.equal(scan.data.action, 'cleanFriend');
+  assert.equal(scan.data.outcome, 'confirmed');
+  assert.equal(f.calls.includes('StealProduce'), false);
+  assert.ok(records.some(row => row.meta.action === 'stealFriend' && row.meta.reason === 'no_friend_targets'));
+  assert.ok(records.some(row => row.meta.action === 'cleanFriend' && row.meta.result === 'confirmed'));
+});
+
+test('friend patrol keeps its candidate during priority deferral and stops after an uncertain result', async () => {
+  const f = fixture();
+  f.realScene = true;
+  f.friendHosts.push('74');
+  f.friendRoster.push({ gid: '73' }, { gid: '74' });
+  f.friendRanches.push({ ranch_inst_id: '51', shelves: [
+    { slot_index: 0, can_steal: true, lots: [{ item_id: '1060001', can_steal: true, remain_num: '2' }] },
+  ], hazards: [{ hazard_id: '2', owner: '50', hazard_type: 1 }] });
+  await setOnlyAutomation(f, { friendSteal: true, friendClean: true });
+  f.farmPriority = true;
+  assert.equal((await f.service.automate()).code, 'RANCH_FARM_PRIORITY');
+  assert.deepEqual(f.calls, []);
+  f.advance(30001);
+  f.farmPriority = false;
+  f.timeout();
+  assert.equal((await f.service.automate()).data.outcome, 'unknown');
+  assert.deepEqual(f.friendVisits, ['73']);
+  assert.equal(f.calls.includes('CleanAllRanch'), false);
+  assert.equal(f.scene.snapshot().scene, 1);
+  f.advance(300001);
+  assert.equal((await f.make().automate()).data.skipped, true);
+  assert.equal(f.writes, 1);
+});
+
+test('friend ranch verifies visit identity, previews available targets and confirms each write once', async () => {
+  const f = fixture();
+  f.friendRanches.push({ ranch_inst_id: '51', shelves: [
+    { slot_index: 0, can_steal: true, lots: [{ item_id: '1060001', can_steal: true, remain_num: '2' }] },
+    { slot_index: 1, can_steal: true, lots: [{ item_id: '1060002', can_steal: true, remain_num: '2', stealers: ['42'] }] },
+  ], hazards: [{ hazard_id: '2', owner: '50', hazard_type: 1 }, { hazard_id: '3', owner: '42', hazard_type: 1 }] });
+  const friend = await f.service.getFriend('73');
+  assert.equal(friend.ok, true, friend.error);
+  assert.deepEqual([friend.data.stealCount, friend.data.cleanCount], [1, 1]);
+  assert.deepEqual(f.calls, ['EnterHomestead', 'GetRanchDetail', 'LeaveHomestead']);
+  for (const action of ['stealFriend', 'cleanFriend']) {
+    const before = f.writes;
+    const quote = await f.service.prepare(action, { hostGid: '73' });
+    assert.equal(quote.ok, true, quote.error);
+    assert.equal(f.writes, before);
+    const result = await f.service.execute(quote.data.id);
+    assert.equal(result.data.outcome, 'confirmed', result.data.message);
+    assert.equal(result.data.completed, 1);
+    assert.equal(f.writes, before + 1);
+    assert.equal(f.calls.at(-1), 'LeaveHomestead');
+    assert.equal((await f.service.execute(quote.data.id)).data.replayed, true);
+    assert.equal(f.writes, before + 1);
+  }
+  f.tourist = true;
+  assert.equal((await f.service.getFriend('73')).code, 'RANCH_FRIEND_UNAVAILABLE');
+  assert.deepEqual(f.calls.slice(-2), ['EnterHomestead', 'LeaveHomestead']);
+  f.tourist = false;
+  f.friendRanches[0].ranch_inst_id = '91';
+  assert.equal((await f.service.getFriend('73')).code, 'RANCH_RESPONSE_MISMATCH');
+  assert.equal(f.calls.at(-1), 'LeaveHomestead');
+  assert.equal((await f.service.prepare('stealFriend', { hostGid: '42' })).code, 'RANCH_INVALID_ARGUMENT');
+  assert.equal(f.writes, 2);
+});
+
+test('friend ranch rechecks targets before dispatch and keeps mismatched receipts unresolved', async () => {
+  const f = fixture();
+  const lot = { item_id: '1060001', can_steal: true, remain_num: '2' };
+  f.friendRanches.push({ ranch_inst_id: '51', shelves: [{ slot_index: 0, can_steal: true, lots: [lot] }] });
+  const quote = await f.service.prepare('stealFriend', { hostGid: '73' });
+  assert.equal(quote.ok, true);
+  lot.can_steal = false;
+  assert.equal((await f.service.execute(quote.data.id)).code, 'RANCH_STATE_CHANGED');
+  assert.equal(f.writes, 0);
+  lot.can_steal = true;
+  f.mutateReply = reply => ({ ...reply, op_results: [{ ...reply.op_results[0], facility_inst_id: '12' }] });
+  const result = await f.service.execute(quote.data.id);
+  assert.equal(result.data.outcome, 'unknown');
+  assert.equal(result.data.friendGid, '73');
+  assert.equal((await f.service.execute(quote.data.id)).data.replayed, true);
+  assert.equal((await f.service.prepare('stealFriend', { hostGid: '73' })).code, 'RANCH_RESULT_UNCONFIRMED');
+  assert.equal((await f.service.getState()).ok, true);
+  assert.equal((await f.service.acknowledge(quote.data.id)).code, 'RANCH_REFRESH_REQUIRED');
+  assert.equal((await f.service.getFriend('73')).ok, true);
+  assert.equal((await f.service.acknowledge(quote.data.id)).data.outcome, 'acknowledged');
+  assert.equal(f.writes, 1);
+});
+
 test('real service prepares without writes; fresh price changes reject, confirmed receipt is not replayed', async () => {
   const f = fixture(); const id = await quoteBuy(f); assert.equal(f.writes, 0);
   f.price(11); assert.equal((await f.service.execute(id)).code, 'RANCH_STATE_CHANGED'); assert.equal(f.writes, 0);
@@ -233,7 +750,7 @@ test('invalid refreshed state cannot authorize acknowledgement of an unknown wri
 test('place checks new animal and exact destination, duplicate and missing receipt targets', async () => {
   for (const mutate of [null, r => ({ op_results: r.op_results.map(x => ({ ...x, facility_inst_id: '99' })) }),
     r => ({ op_results: [r.op_results[0], r.op_results[0]] }), () => ({ op_results: [] })]) {
-    const f = fixture(); f.mutateReply = mutate;
+    const f = fixture(); f.mutateReply = mutate; f.cubs.set('60001', 5);
     const quote = await f.service.prepare('place', { ranchId: '11', itemId: '60001', count: 2 }); assert.equal(quote.ok, true);
     const result = await f.service.execute(quote.data.id); assert.equal(result.data.outcome, mutate ? 'unknown' : 'confirmed');
   }
@@ -365,4 +882,792 @@ test('invalid upgrade instance never requests its detail and a mismatched start 
   const result = await f.service.execute(q.data.id);
   assert.equal(result.data.outcome, 'unknown'); assert.equal(f.writes, 1);
   assert.equal((await f.service.execute(q.data.id)).data.replayed, true); assert.equal(f.writes, 1);
+});
+
+const stockPolicy = { enabled: true, harvest: false, produce: false, clean: false, tasks: false,
+  stockCoop: true, buyMissingCubs: true, cubDailyLimit: 10, currencyDailyLimit: 100, intervalMinutes: 2 };
+const chick = { id: '10002', item_id: '60001', item_count: '1', price: '10', unlocked: true };
+const duck = { ...chick, id: '10003', item_id: '60002', conds: [{ type: 3, param: '12' }] };
+const sheep = { ...chick, id: '10008', item_id: '70001' };
+const stockRoom = (id, type, capacity) => ({ instance_id: id, facility_id: type === 1 ? 6001001 : 6002001,
+  module_type: 5 + type, state: 1, level: 1, capacity, ranch: { ranch_inst_id: id, capacity, animal_count: 0, husbandry_type: type, animals: [] } });
+
+async function startStock(f, overrides = {}) {
+  const saved = await f.service.setAutomation({ ...stockPolicy, ...overrides });
+  assert.equal(saved.ok, true, saved.error);
+  f.advance(30000);
+}
+async function stockRound(f) {
+  const result = await f.service.automate();
+  assert.equal(result.ok, true, result.error);
+  if (!result.data.skipped) assert.equal(result.data.outcome, 'confirmed', result.data.message);
+  f.advance(120000);
+  return result.data;
+}
+
+test('stock scheduler places matching unlocked inventory, then buys the highest live tier and stops at capacity', async () => {
+  const f = fixture();
+  f.cubs.set('60001', 1);
+  f.lockedCubs.push({ id: '60001', count: '8', is_locked: true });
+  const goods = [
+    { ...chick, conds: [{ type: 3, param: '2' }] },
+    { ...duck, item_count: '2', limit_count: '4', bought_num: '3' },
+    { ...duck, id: '10004', item_id: '60003', conds: [{ type: 3, param: '8' }] },
+    { ...duck, id: '10005', item_id: '60004', unlocked: false, conds: [{ type: 3, param: '18' }] },
+    sheep,
+  ];
+  f.goods = () => goods;
+  await startStock(f);
+
+  const placed = await stockRound(f);
+  assert.equal(placed.action, 'place');
+  assert.equal(placed.completed, 1);
+  assert.equal(f.calls.includes('ShopInfo'), false, 'stock placement works independently of the shop');
+  const purchased = await stockRound(f);
+  assert.equal(purchased.action, 'buy');
+  assert.equal(purchased.completed, 1);
+  assert.deepEqual(purchased.rewards.map(item => [item.id, item.count]), [['60002', '2']]);
+  assert.deepEqual(purchased.costs.map(item => [item.id, item.count]), [['1007', '10']]);
+  const rest = await stockRound(f);
+  assert.equal(rest.action, 'place');
+  assert.equal(rest.completed, 2);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal(f.writes, 3);
+});
+
+test('stock scheduler shares daily and reserve limits and buys only whole packs within the net shortage', async () => {
+  for (const [overrides, expected] of [
+    [{ currencyDailyLimit: 25 }, 2],
+    [{ currencyReserve: 79 }, 2],
+    [{ cubDailyLimit: 3 }, 1],
+    [{ cubReserve: 4, currencyDailyLimit: 20 }, 0],
+  ]) {
+    const f = fixture();
+    f.facilities[0] = stockRoom('11', 1, 7);
+    const pack = { ...duck, item_count: '2' };
+    f.goods = () => [pack];
+    await startStock(f, overrides);
+    const result = await stockRound(f);
+    assert.equal(result.completed ?? 0, expected, JSON.stringify(overrides));
+    if (expected) assert.equal(Number(result.rewards[0].count), expected * 2);
+  }
+
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 10);
+  const pack = { ...duck, item_count: '2', limit_count: '5', bought_num: '4' };
+  f.goods = () => [pack];
+  await startStock(f);
+  assert.equal((await stockRound(f)).completed, 1);
+  assert.equal((await stockRound(f)).completed, 2);
+  assert.equal((await stockRound(f)).skipped, true, 'shop limit stops further buy approvals');
+  assert.equal(f.writes, 2);
+});
+
+test('an unavailable coop slot does not displace the shed turn, and either type can be enabled alone', async () => {
+  for (const [coop, shed] of [[true, true], [true, false], [false, true]]) {
+    const f = fixture();
+    f.facilities[0] = { ...stockRoom('11', 1, 3), state: 2 };
+    f.facilities.push(stockRoom('12', 2, 3));
+    f.cubs.set('60001', 3);
+    f.cubs.set('70001', 1);
+    f.goods = () => [chick, sheep];
+    await startStock(f, { stockCoop: coop, stockShed: shed });
+    if (coop) assert.equal((await stockRound(f)).skipped, true);
+    const result = await stockRound(f);
+    if (!shed) assert.equal(result.skipped, true);
+    else {
+      assert.equal(result.action, 'place');
+      assert.equal(f.facilities[2].ranch.animal_count, 1);
+      if (coop) assert.equal((await stockRound(f)).skipped, true);
+      const purchase = await stockRound(f);
+      assert.equal(purchase.action, 'buy');
+      assert.deepEqual(purchase.rewards.map(item => [item.id, item.count]), [['70001', '2']]);
+    }
+    assert.equal(f.cubs.get('60001'), 3);
+  }
+});
+
+test('stock scheduler ignores unknown occupancy and missing compatible offers', async () => {
+  for (const failure of ['missing ranch', 'missing occupants', 'upgrade', 'no compatible goods', 'duplicate offer']) {
+    const f = fixture();
+    if (failure === 'missing ranch') delete f.facilities[0].ranch;
+    if (failure === 'missing occupants') f.facilities[0].ranch.animals = [];
+    if (failure === 'upgrade') f.facilities[0].upgrade_state = 1;
+    if (failure === 'no compatible goods') f.goods = () => [sheep];
+    if (failure === 'duplicate offer') f.goods = () => [chick, { ...chick, price: '1' }];
+    await startStock(f);
+    assert.equal((await stockRound(f)).skipped, true, failure);
+    assert.equal(f.writes, 0, failure);
+  }
+});
+
+test('both prepare and execute check fresh stocking requirements before any dispatch', async () => {
+  for (const changeAt of [2, 3]) {
+    for (const change of ['new stock', 'filled room', 'best offer changes', 'currency reserve changes']) {
+      const f = fixture();
+      let reads = 0;
+      let goods = [chick];
+      f.goods = () => goods;
+      f.onRead = method => {
+        if (method === 'AllCells' && change === 'filled room' && reads + 1 === changeAt)
+          f.facilities[0].ranch.capacity = 1;
+        if (method !== 'GetBag' || ++reads !== changeAt) return;
+        if (change === 'new stock') f.cubs.set('60002', 3);
+        if (change === 'best offer changes') goods = [chick, duck];
+        if (change === 'currency reserve changes') f.gold(34);
+      };
+      await startStock(f, change === 'currency reserve changes' ? { currencyReserve: 5 } : { stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+      const result = await f.service.automate();
+      assert.equal(result.code, 'RANCH_AUTOMATION_PAUSED', `${change} during read ${changeAt}: ${JSON.stringify(result)}`);
+      assert.equal(f.writes, 0);
+      assert.deepEqual((await f.service.getAutomation()).data.usage, {});
+    }
+  }
+});
+
+test('an unknown automatic purchase blocks all subsequent stock writes after service replacement', async () => {
+  const f = fixture();
+  f.facilities.push(stockRoom('12', 2, 3));
+  f.goods = () => [chick, sheep];
+  await startStock(f, { stockShed: true, stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+  f.timeout();
+  const timedOut = await f.service.automate();
+  assert.equal(timedOut.data.outcome, 'unknown');
+  assert.equal(f.writes, 1);
+  const calls = [...f.calls];
+  f.advance(86400000);
+  assert.equal((await f.make().automate()).data.skipped, true);
+  assert.deepEqual(f.calls, calls);
+});
+
+test('saved fixed cub purchases are bounded by compatible net vacancy and do not opt in to stock placement', async () => {
+  const f = fixture();
+  f.cubs.set('60002', 2);
+  f.facilities.push(stockRoom('12', 2, 3));
+  await startStock(f, { stockCoop: false, buyEnabled: true, goodsId: '10002', purchaseCount: 5 });
+  const data = JSON.parse(fs.readFileSync(f.file, 'utf8'));
+  delete data.automation.policy.stockCoop;
+  delete data.automation.policy.stockShed;
+  delete data.automation.policy.buyMissingCubs;
+  fs.writeFileSync(f.file, JSON.stringify(data));
+  const purchase = await stockRound(f);
+  assert.equal(purchase.action, 'buy');
+  assert.equal(purchase.completed, 1);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal(f.writes, 1);
+  assert.equal((await f.service.getAutomation()).data.policy.stockShed, false);
+});
+
+test('an explicitly authorized non-cub purchase keeps its order quantity with full facilities', async () => {
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 1);
+  f.goods = () => [{ ...chick, id: '10001', item_id: '7001' }];
+  await startStock(f, { stockCoop: false, buyEnabled: true, shopId: '6', goodsId: '10001', purchaseCount: 2 });
+  const result = await stockRound(f);
+  assert.equal(result.action, 'buy');
+  assert.equal(result.completed, 2);
+  assert.deepEqual(result.rewards.map(item => [item.id, item.count]), [['7001', '2']]);
+});
+
+test('confirmed purchases exhaust the shared spend allowance before another stock purchase', async () => {
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 5);
+  f.facilities.push(stockRoom('12', 2, 5));
+  f.goods = () => [chick, sheep];
+  await startStock(f, { stockShed: true, currencyDailyLimit: 20 });
+  assert.equal((await stockRound(f)).completed, 2);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.deepEqual((await f.service.getAutomation()).data.usage, { 'buy:1007': '20', 'place:60001': '2' });
+});
+
+test('loss of automatic admission after reserving a stock order keeps the request unsent', async t => {
+  const f = fixture();
+  await startStock(f, { stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+  const original = codec.encode;
+  t.mock.method(codec, 'encode', (name, payload) => {
+    const bytes = original(name, payload);
+    if (name === codec.ROUTES.buy.request) f.allow(false);
+    return bytes;
+  });
+  const result = await f.service.automate();
+  assert.equal(result.data.outcome, 'not_sent');
+  assert.equal(f.writes, 0);
+  assert.equal(f.calls.includes('BuyGoods'), false);
+  assert.equal((await f.service.getAutomation()).data.usage['buy:1007'], '0');
+});
+
+test('coop and shed can place only existing cubs with a zero purchase budget, then resume after inventory arrives', async () => {
+  const f = fixture();
+  f.facilities.push(stockRoom('12', 2, 3));
+  f.cubs.set('60001', 1);
+  await startStock(f, { stockShed: true, buyMissingCubs: false, stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal((await stockRound(f)).skipped, true);
+  f.cubs.set('70001', 1);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal(f.facilities[2].ranch.animal_count, 1);
+  assert.equal(f.calls.includes('ShopInfo'), false);
+  assert.equal(f.calls.includes('BuyGoods'), false);
+});
+
+test('live stock mode buys only what current vacancies, available tickets and shop limits allow', async () => {
+  for (const { vacancies, tickets, remaining, count } of [
+    { vacancies: 3, tickets: 20, remaining: 5, count: 1 },
+    { vacancies: 8, tickets: 25, remaining: 5, count: 2 },
+    { vacancies: 8, tickets: 80, remaining: 1, count: 1 },
+    { vacancies: 8, tickets: 9, remaining: 5, count: 0 },
+  ]) {
+    const f = fixture();
+    f.facilities[0] = stockRoom('11', 1, vacancies);
+    f.gold(tickets);
+    const pack = { ...duck, item_count: '2', limit_count: '5', bought_num: String(5 - remaining) };
+    f.goods = () => [pack];
+    await startStock(f, { stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+    const result = await stockRound(f);
+    assert.equal(result.completed ?? 0, count);
+    if (count) {
+      assert.equal(result.action, 'buy');
+      assert.deepEqual(result.costs.map(item => [item.id, item.count]), [['1007', String(count * 10)]]);
+      assert.equal((await stockRound(f)).completed, count * 2);
+    }
+    assert.equal((await stockRound(f)).skipped, true);
+  }
+});
+
+test('live stock buys the highest affordable unlocked tier with verified shop level conditions', async () => {
+  const f = fixture();
+  f.gold(1100);
+  f.goods = () => [
+    { ...chick, price: '2', conds: [{ type: 3, param: '1' }] },
+    { ...duck, price: '1080', conds: [{ type: 3, param: '3' }] },
+    { ...duck, id: '10004', item_id: '60003', price: '2712', conds: [{ type: 3, param: '9' }] },
+  ];
+  await startStock(f, { stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+  const result = await stockRound(f);
+  assert.equal(result.action, 'buy');
+  assert.equal(result.completed, 1);
+  assert.deepEqual(result.rewards.map(item => [item.id, item.count]), [['60002', '1']]);
+  assert.equal(result.costs[0].count, '1080');
+});
+
+test('a persisted stocking policy without a mode reloads as manual and keeps its previous budget', async () => {
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 5);
+  await startStock(f, { cubDailyLimit: 3, currencyDailyLimit: 10 });
+  const data = JSON.parse(fs.readFileSync(f.file, 'utf8'));
+  delete data.automation.policy.stockBudgetMode;
+  fs.writeFileSync(f.file, JSON.stringify(data));
+  f.service = f.make();
+  const policy = (await f.service.getAutomation()).data.policy;
+  assert.equal(policy.stockBudgetMode, 'manual');
+  assert.equal(policy.cubDailyLimit, 3);
+  assert.equal(policy.currencyDailyLimit, 10);
+  assert.equal((await stockRound(f)).completed, 1);
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal((await stockRound(f)).skipped, true);
+});
+
+test('selecting live stock preserves manual quota semantics for existing fixed actions', async () => {
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 4);
+  const food = { ...chick, id: '10001', item_id: '7001' };
+  f.goods = () => [food, chick];
+  await startStock(f, { stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 10, buyEnabled: true,
+    shopId: '6', goodsId: food.id, purchaseCount: 2 });
+  assert.equal((await stockRound(f)).skipped, true, 'fixed purchase retains its manual quota');
+  assert.equal((await stockRound(f)).completed, 4, 'stock purchase is capped by live vacancy');
+  assert.equal((await f.service.getAutomation()).data.usage['buy:1007'], '40');
+});
+
+test('inventory-only stock owns the coop, including when two same-type fixed rules are retained with no quotas', async () => {
+  const f = fixture();
+  f.cubs.set('60002', 1);
+  const policy = { ...stockPolicy, stockBudgetMode: 'live', buyMissingCubs: false, cubDailyLimit: 0, currencyDailyLimit: 0,
+    placeEnabled: true, ranchId: '11', cubId: '60001', buyEnabled: true, goodsId: '10002' };
+  const saved = await f.service.setAutomation(policy);
+  assert.equal(saved.ok, true, saved.error);
+  assert.equal(saved.data.targetTypes.cubs['60002'], 1);
+  assert.equal(saved.data.targetTypes.goods['10008'], 2);
+  assert.equal(saved.data.targetTypes.goods['10001'], undefined);
+  assert.deepEqual((await f.service.getAutomation()).data.targetTypes, saved.data.targetTypes);
+  for (const [name, value] of Object.entries(policy)) assert.equal(saved.data.policy[name], value, name);
+  f.advance(30000);
+  const buy = { shopId: '5', goodsId: '10002', count: 1 };
+  const place = { ranchId: '11', itemId: '60001', count: 1 };
+  assert.equal((await f.service.prepare('buy', buy, saved.data.revision)).code, 'RANCH_AUTOMATION_PAUSED');
+  assert.equal((await f.service.prepare('place', place, saved.data.revision)).code, 'RANCH_AUTOMATION_PAUSED');
+  assert.deepEqual(f.calls, []);
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal(f.calls.includes('ShopInfo'), false);
+
+  const parked = await f.service.setAutomation({ ...policy, stockCoop: false });
+  assert.equal(parked.ok, true, parked.error);
+  assert.equal(parked.data.policy.placeEnabled, true);
+  assert.equal(parked.data.policy.buyEnabled, true);
+  f.service = f.make();
+  f.advance(30000);
+  f.calls.length = 0;
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.deepEqual(f.calls, []);
+  assert.equal(f.writes, 1);
+});
+
+test('turning off coop ownership restores valid fixed purchase and placement without reselecting their targets', async () => {
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 3);
+  const policy = { ...stockPolicy, stockBudgetMode: 'live', buyMissingCubs: false,
+    placeEnabled: true, cubId: '60001', ranchId: '11', buyEnabled: true, goodsId: '10002' };
+  await startStock(f, policy);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal(f.calls.includes('ShopInfo'), false);
+
+  const restored = await f.service.setAutomation({ ...policy, stockCoop: false });
+  assert.equal(restored.ok, true, restored.error);
+  f.advance(30000);
+  assert.equal((await stockRound(f)).skipped, true, 'fixed placement waits for inventory');
+  assert.equal((await stockRound(f)).action, 'buy');
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal(f.facilities[0].ranch.animal_count, 1);
+});
+
+test('coop ownership leaves fixed shed rules and purchases of feed eligible', async () => {
+  const f = fixture();
+  f.facilities.push(stockRoom('12', 2, 4));
+  f.cubs.set('70001', 1);
+  f.goods = () => [sheep];
+  const policy = { ...stockPolicy, stockBudgetMode: 'live', buyMissingCubs: false,
+    placeEnabled: true, cubId: '70001', ranchId: '12', buyEnabled: true, goodsId: '10008', purchaseCount: 2 };
+  await startStock(f, policy);
+  assert.equal((await stockRound(f)).action, 'place');
+  const shedPurchase = await stockRound(f);
+  assert.equal(shedPurchase.action, 'buy');
+  assert.equal(shedPurchase.rewards[0].id, '70001');
+  const food = { ...chick, id: '10001', item_id: '7001' };
+  f.goods = () => [food];
+  const saved = await f.service.setAutomation({ ...policy, placeEnabled: false, shopId: '6', goodsId: food.id });
+  assert.equal(saved.ok, true, saved.error);
+  f.advance(120000);
+  let purchase = await stockRound(f);
+  if (purchase.skipped) purchase = await stockRound(f);
+  assert.equal(purchase.action, 'buy');
+  assert.equal(purchase.rewards[0].id, '7001');
+});
+
+test('claiming a type during a fixed action preflight prevents dispatch without affecting a one-off manual quote', async () => {
+  for (const action of ['buy', 'place']) {
+    for (const phase of ['prepare', 'execute']) {
+      const f = fixture();
+      f.cubs.set('60001', 1);
+      const policy = { ...stockPolicy, stockCoop: false, stockBudgetMode: 'live', buyMissingCubs: false,
+        placeEnabled: true, cubId: '60001', ranchId: '11', buyEnabled: true, goodsId: '10002' };
+      const saved = await f.service.setAutomation(policy);
+      const input = action === 'buy' ? { shopId: '5', goodsId: '10002', count: 1 } : { ranchId: '11', itemId: '60001', count: 1 };
+      const prepare = () => f.service.prepare(action, input, saved.data.revision);
+      const pending = phase === 'execute' ? await prepare() : null;
+      if (pending) assert.equal(pending.ok, true, pending.error);
+      f.onRead = async method => {
+        if (method !== (action === 'buy' ? 'ShopInfo' : 'GetBag')) return;
+        f.onRead = null;
+        const edited = await f.service.setAutomation({ ...policy, stockCoop: true });
+        assert.equal(edited.ok, true, edited.error);
+      };
+      const blocked = pending ? await f.service.execute(pending.data.id) : await prepare();
+      assert.equal(blocked.code, 'RANCH_AUTOMATION_PAUSED');
+      assert.equal(f.writes, 0);
+      const manual = await f.service.prepare(action, input);
+      assert.equal(manual.ok, true, manual.error);
+      assert.equal((await f.service.execute(manual.data.id)).data.outcome, 'confirmed');
+      assert.equal(f.writes, 1);
+    }
+  }
+});
+
+test('stock places the highest confirmed tier across stacks, selecting the room that fits the most per operation', async () => {
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 1);
+  f.facilities.push(stockRoom('13', 1, 4));
+  f.cubs.set('60002', 5);
+  f.cubs.set('60001', 3);
+  f.goods = () => [
+    { ...duck, conds: [{ type: 3, param: '2' }] },
+    { ...chick, conds: [{ type: 3, param: '4' }] },
+  ];
+  await startStock(f, { stockBudgetMode: 'live', buyMissingCubs: false });
+  const placed = await stockRound(f);
+  assert.equal(placed.action, 'place');
+  assert.equal(placed.completed, 3);
+  assert.equal(placed.costs[0].id, '60001');
+  assert.equal(f.facilities[0].ranch.animal_count, 0);
+  assert.equal(f.facilities[2].ranch.animal_count, 3);
+  assert.equal(f.calls.filter(call => call === 'ShopInfo').length, 3, 'discovery and both checks use fresh shop tier data');
+  assert.deepEqual(f.leases, [7, 7, 10], 'scene limits cover shop reads in all three stages');
+  f.calls.length = 0;
+  assert.equal((await stockRound(f)).costs[0].id, '60002');
+  assert.equal(f.calls.includes('ShopInfo'), false, 'one inventory type needs no shop lookup');
+});
+
+test('stock rechecks changing inventory tiers before placement without sending the earlier candidate', async () => {
+  const f = fixture();
+  f.cubs.set('60002', 2);
+  f.cubs.set('60001', 2);
+  let reads = 0;
+  f.goods = () => {
+    reads++;
+    return [
+      { ...duck, conds: [{ type: 3, param: reads < 3 ? '2' : '5' }] },
+      { ...chick, conds: [{ type: 3, param: '4' }] },
+    ];
+  };
+  await startStock(f, { stockBudgetMode: 'live', buyMissingCubs: false });
+  const rejected = await f.service.automate();
+  assert.equal(rejected.code, 'RANCH_AUTOMATION_PAUSED');
+  assert.equal(reads, 3);
+  assert.equal(f.calls.includes('PlaceAnimal'), false);
+});
+
+test('a manual cub preview reserves its type until confirmation or expiry, while other facilities may restock', async () => {
+  for (const settle of ['confirm', 'expire']) {
+    const f = fixture();
+    f.cubs.set('60001', 2);
+    await startStock(f, { stockBudgetMode: 'live', buyMissingCubs: false });
+    const manual = await f.service.prepare('place', { ranchId: '11', itemId: '60001', count: 1 });
+    assert.equal(manual.ok, true);
+    f.calls.length = 0;
+    assert.equal((await f.service.automate()).data.skipped, true);
+    assert.deepEqual(f.calls, [], 'no scene read or competing write while the owner reviews the same type');
+    if (settle === 'confirm') assert.equal((await f.service.execute(manual.data.id)).data.completed, 1);
+    else f.advance(manual.data.validForMs + 1);
+    assert.equal((await f.service.automate()).data.completed, settle === 'confirm' ? 1 : 2);
+  }
+
+  const f = fixture();
+  f.facilities.push(stockRoom('12', 2, 2));
+  f.cubs.set('70001', 1);
+  await startStock(f, { stockCoop: true, stockShed: true, stockBudgetMode: 'live' });
+  const manual = await f.service.prepare('buy', { shopId: '5', goodsId: '10002', count: 1 });
+  assert.equal(manual.ok, true);
+  const result = await f.service.automate();
+  assert.equal(result.data.action, 'place');
+  assert.equal(result.data.costs[0].id, '70001');
+  assert.equal(f.calls.includes('BuyGoods'), false);
+});
+
+function ranchLogs(t) {
+  const records = [];
+  const { setLogHook } = require('../src/utils/utils');
+  setLogHook((tag, message, isWarn, meta) => records.push({ tag, message, isWarn, meta }));
+  t.after(() => setLogHook(null));
+  return records;
+}
+
+test('automation logs confirmed purchases with true receipt data and skips manual, replayed, and timer-only work', async t => {
+  const records = ranchLogs(t);
+  const f = fixture();
+  await startStock(f, { stockBudgetMode: 'live', cubDailyLimit: 0, currencyDailyLimit: 0 });
+  assert.equal(records.length, 0);
+  const result = await f.service.automate();
+  assert.equal(result.data.outcome, 'confirmed');
+  const [entry] = records;
+  assert.equal(records.length, 1);
+  assert.equal(entry.tag, '牧场');
+  assert.equal(entry.isWarn, false);
+  assert.equal(entry.meta.automationCategory, 'ranch');
+  assert.equal(entry.meta.event, 'ranch_automation_action');
+  assert.equal(entry.meta.action, 'buy');
+  assert.equal(entry.meta.completed, 3);
+  assert.equal(entry.meta.result, 'confirmed');
+  assert.deepEqual(entry.meta.costs, [{ name: '金券', count: '30' }]);
+  assert.deepEqual(entry.meta.rewards, [{ name: '鸡幼崽', count: '3' }]);
+  assert.match(entry.message, /自动购买.*鸡幼崽.*3\/3.*金券×30.*鸡幼崽×3/);
+  assert.equal((await f.service.execute(result.data.id)).data.replayed, true);
+  for (let tick = 0; tick < 3; tick++) {
+    f.advance(30000);
+    assert.equal((await f.service.automate()).data.skipped, true);
+  }
+  const manual = await f.service.prepare('buy', { shopId: '5', goodsId: '10002', count: 1 });
+  assert.equal((await f.service.execute(manual.data.id)).data.outcome, 'confirmed');
+  assert.equal(records.length, 1);
+});
+
+test('automation logs true confirmed partial amounts and clearly pauses, without another action entry on repeated ticks', async t => {
+  const records = ranchLogs(t);
+  const f = fixture();
+  f.facilities[0].ranch.animals.push({ ranch_inst_id: '11', animal_inst_id: 8, animal_id: '60001', can_harvest: true });
+  f.mutateReply = reply => ({ ...reply, op_results: reply.op_results.map(item => ({ ...item,
+    rewards: [{ id: '2060001', count: '2' }], costs: [{ id: '7001', count: '1' }] })) });
+  await startStock(f, { stockCoop: false, harvest: true });
+  const result = await f.service.automate();
+  assert.equal(result.data.outcome, 'partial');
+  assert.equal(records.length, 1);
+  assert.equal(records[0].meta.result, 'partial');
+  assert.equal(records[0].meta.completed, 1);
+  assert.equal(records[0].meta.requested, 2);
+  assert.deepEqual(records[0].meta.rewards.map(item => item.count), ['2']);
+  assert.deepEqual(records[0].meta.costs, [{ name: '牧草', count: '1' }]);
+  assert.match(records[0].message, /部分确认.*已暂停.*人工核对/);
+  f.advance(120000);
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.equal(records.length, 1);
+});
+
+test('automation distinguishes unknown, proven unsent, and preflight error without leaking upstream diagnostics', async t => {
+  const records = ranchLogs(t);
+  for (const outcome of ['unknown', 'not_sent', 'error']) {
+    const f = fixture();
+    await startStock(f, { stockBudgetMode: 'live' });
+    if (outcome === 'unknown') f.timeout();
+    else if (outcome === 'not_sent') f.rejectUnsent = true;
+    else {
+      let reads = 0;
+      f.onRead = method => {
+        if (method === 'ShopInfo' && ++reads === 2) throw new Error('internal fixture upstream detail');
+      };
+    }
+    const result = await f.service.automate();
+    const entry = records.at(-1);
+    if (outcome === 'error') assert.equal(result.ok, false);
+    else assert.equal(result.data.outcome, outcome);
+    assert.equal(entry.meta.event, 'ranch_automation_action');
+    assert.equal(entry.meta.result, outcome);
+    assert.equal(entry.meta.action, 'buy');
+    assert.equal(entry.meta.completed, 0);
+    assert.deepEqual(entry.meta.costs, []);
+    assert.deepEqual(entry.meta.rewards, []);
+    assert.equal(entry.isWarn, true);
+    if (outcome === 'unknown') {
+      assert.match(entry.message, /结果未知.*已暂停.*人工核对/);
+      f.advance(86400000);
+      assert.equal((await f.make().automate()).data.skipped, true);
+      assert.equal(records.length, 1);
+    }
+  }
+  assert.equal(records.length, 3);
+  assert.ok(!JSON.stringify(records).includes('internal fixture upstream detail'));
+});
+
+test('enabled due rounds report concrete stop reasons only when the reason changes', async t => {
+  const records = ranchLogs(t);
+  const f = fixture();
+  f.facilities[0] = stockRoom('11', 1, 3);
+  f.gold(0);
+  await startStock(f, { stockBudgetMode: 'live' });
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.deepEqual(records.map(row => row.meta.reason), ['insufficient_balance']);
+  f.service = f.make();
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.deepEqual(records.map(row => row.meta.reason), ['insufficient_balance']);
+  f.gold(100);
+  f.goods = () => [{ ...chick, limit_count: '1', bought_num: '1' }];
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).skipped, true);
+  f.goods = () => [];
+  assert.equal((await stockRound(f)).skipped, true);
+  f.cubs.set('60001', 3);
+  assert.equal((await stockRound(f)).action, 'place');
+  assert.equal(records.at(-1).meta.action, 'place');
+  for (const part of ['自动放养', '窝', '鸡幼崽', '3/3']) assert.ok(records.at(-1).message.includes(part));
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.deepEqual(records.filter(row => row.meta.event === 'ranch_automation_status').map(row => row.meta.reason),
+    ['insufficient_balance', 'shop_limit', 'no_product', 'full']);
+  const saved = await f.service.setAutomation({ ...stockPolicy, enabled: false });
+  assert.equal(saved.ok, true, saved.error);
+  const previous = records.length;
+  assert.equal((await stockRound(f)).skipped, true);
+  assert.equal(records.length, previous);
+});
+
+function cancelViaRoute(f) {
+  const { createActivityReadCache } = require('../src/controllers/activity-read-cache');
+  const { registerAdminRanchRoutes } = require('../src/controllers/admin-ranch-routes');
+  const routes = new Map();
+  const id = 'account-a';
+  registerAdminRanchRoutes({
+    app: { get() {}, post: (route, handler) => routes.set(route, handler) },
+    getAccountIdFromRequest: () => id, canAccessAccount: () => true,
+    provider: {
+      isAccountRunning: () => true,
+      getStatus: () => ({ connection: { connected: false } }),
+      getGamePanelReadScope: () => JSON.stringify([id, 'binding', 1, 'host', 1, 1, 1]),
+      cancelRanchAction: (account, quote) => {
+        assert.equal(account, id);
+        return f.service.cancel(quote);
+      },
+    },
+    activityReader: createActivityReadCache(),
+    sendProviderError: (_res, error) => { throw error; },
+  });
+  return async quoteId => {
+    const res = { code: 200, status(code) { this.code = code; return this; }, json(body) { this.body = body; } };
+    await routes.get('/api/ranch/cancel')({ body: { quoteId } }, res);
+    return { code: res.code, body: res.body };
+  };
+}
+
+test('cancel over the offline worker route returns the reserved type to an already-due stock round', async () => {
+  const f = fixture();
+  f.cubs.set('60001', 2);
+  await startStock(f, { stockBudgetMode: 'live', buyMissingCubs: false });
+  const quote = await f.service.prepare('place', { ranchId: '11', itemId: '60001', count: 1 });
+  assert.equal(quote.ok, true);
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.equal(f.writes, 0);
+  const cancel = cancelViaRoute(f);
+  const calls = f.calls.length;
+  assert.deepEqual(await cancel(quote.data.id), { code: 200, body: { ok: true, data: { cancelled: true } } });
+  assert.equal((await cancel(quote.data.id)).code, 409);
+  assert.equal(f.calls.length, calls);
+  assert.equal(f.writes, 0);
+  const reopened = f.make();
+  assert.equal((await reopened.execute(quote.data.id)).data.outcome, 'not_sent');
+  assert.equal(f.writes, 0);
+  const resumed = await f.service.automate();
+  assert.equal(resumed.data.outcome, 'confirmed');
+  assert.equal(resumed.data.costs[0].id, '60001');
+  assert.equal(resumed.data.completed, 2);
+  assert.equal(f.writes, 1);
+});
+
+test('cancel over the offline worker route wins before dispatch during an execute preflight', async () => {
+  const f = fixture(); const id = await quoteBuy(f); const cancel = cancelViaRoute(f);
+  let started, resume;
+  const entered = new Promise(resolve => { started = resolve; });
+  const paused = new Promise(resolve => { resume = resolve; });
+  f.onRead = async method => { if (method === 'GetBag') { started(); await paused; } };
+  const running = f.service.execute(id);
+  await entered;
+  try {
+    assert.equal((await cancel(id)).code, 200);
+    assert.equal(f.writes, 0);
+  } finally { resume(); }
+  assert.equal((await running).data.outcome, 'not_sent');
+  assert.equal(f.writes, 0);
+});
+
+for (const outcome of ['unknown', 'confirmed']) {
+  test(`cancel preserves a dispatched ${outcome} operation and its durable budget`, async () => {
+    const f = fixture(); const cancel = cancelViaRoute(f);
+    await startStock(f, { stockBudgetMode: 'live' });
+    if (outcome === 'unknown') f.timeout();
+    let inFlightCancel;
+    f.beforeWrite(() => {
+      const pending = JSON.parse(fs.readFileSync(f.file, 'utf8'));
+      const usage = pending.automation.usage;
+      assert.equal(pending.lastOperation.outcome, 'pending');
+      assert.ok(BigInt(usage['buy:1007']) > 0n);
+      inFlightCancel = cancel(pending.lastOperation.id);
+    });
+    const result = await f.service.automate();
+    assert.equal(result.data.outcome, outcome);
+    assert.equal((await inFlightCancel).code, 409);
+    assert.equal(f.writes, 1);
+    const before = fs.readFileSync(f.file, 'utf8');
+    assert.ok(BigInt(JSON.parse(before).automation.usage['buy:1007']) > 0n);
+    assert.equal((await cancel(result.data.id)).code, 409);
+    assert.equal(fs.readFileSync(f.file, 'utf8'), before);
+    assert.equal((await f.make().execute(result.data.id)).data.outcome, outcome);
+    assert.equal(f.writes, 1);
+  });
+}
+
+test('cancel preserves a partial operation and the existing spend ledger', async () => {
+  const f = fixture();
+  await startStock(f, { stockBudgetMode: 'live' });
+  assert.equal((await f.service.automate()).data.outcome, 'confirmed');
+  const room = f.facilities[0].ranch;
+  room.animals.push({ ...room.animals[0], animal_inst_id: 8 });
+  room.animal_count = 2;
+  const quote = await f.service.prepare('produce', { all: true });
+  assert.equal(quote.ok, true, quote.error);
+  assert.equal(quote.data.count, 2);
+  assert.equal((await f.service.execute(quote.data.id)).data.outcome, 'partial');
+  const before = fs.readFileSync(f.file, 'utf8');
+  assert.ok(BigInt(JSON.parse(before).automation.usage['buy:1007']) > 0n);
+  assert.equal((await cancelViaRoute(f)(quote.data.id)).code, 409);
+  assert.equal(fs.readFileSync(f.file, 'utf8'), before);
+  assert.equal((await f.make().execute(quote.data.id)).data.outcome, 'partial');
+  assert.equal(f.writes, 2);
+});
+
+
+const ranchProduct = (uid, count, price, flags = {}) => ({
+  id: '1060001', uid, count, show: { sells: [{ id: '1007', count: price }] }, ...flags,
+});
+
+test('牧场批量出售跳过锁定、条件及非产物堆栈，按实际 UID 和报价确认一次', async () => {
+  const f = fixture();
+  const first = ranchProduct('9007199254741001', '3', '2');
+  const second = ranchProduct('9007199254741002', '2', '4');
+  f.products.push(first, second, ranchProduct('9007199254741003', '9', '8', { is_locked: true }),
+    ranchProduct('9007199254741004', '6', '3', { show: { sells: [{ id: '1007', count: '5' }], sell_cond: [{ type: 'synthetic' }] } }),
+    ranchProduct('9007199254741005', '4', '2', { id: '7001' }));
+  const snapshot = await f.service.getState('animals');
+  assert.deepEqual(snapshot.data.inventory.filter(row => row.canSell).map(row => row.uid), [first.uid, second.uid]);
+  const quote = await f.service.prepare('sell', { all: true });
+  assert.equal(quote.ok, true, quote.error);
+  assert.deepEqual(quote.data.costItems.map(row => [row.id, row.count]), [['1060001', '5']]);
+  assert.deepEqual(quote.data.expectedRewards.map(row => [row.id, row.count]), [['1007', '14']]);
+  assert.equal(f.writes, 0);
+  second.show.sells[0].count = '5';
+  assert.equal((await f.service.execute(quote.data.id)).code, 'RANCH_STATE_CHANGED');
+  assert.equal(f.writes, 0);
+  second.show.sells[0].count = '4';
+  const result = await f.service.execute(quote.data.id);
+  assert.equal(result.data.outcome, 'confirmed', JSON.stringify({ message: result.data.message, writes: f.writes }));
+  assert.deepEqual(result.data.rewards.map(row => [row.id, row.count]), [['1007', '14']]);
+  assert.deepEqual(f.products.map(row => row.count), ['0', '0', '9', '6', '4']);
+  assert.equal((await f.make().execute(quote.data.id)).data.replayed, true);
+  assert.equal(f.writes, 1);
+});
+
+test('单批出售只提交确认数量，回执 UID 不匹配时保留未知并拒绝重发', async () => {
+  const f = fixture();
+  const item = ranchProduct('9007199254741001', '5', '3');
+  f.products.push(item);
+  const input = { uid: item.uid, itemId: item.id, count: 2 };
+  const invalid = await f.service.prepare('sell', { ...input, itemId: '2060001' });
+  assert.equal(invalid.code, 'RANCH_STATE_CHANGED');
+  const quote = await f.service.prepare('sell', input);
+  assert.equal(quote.ok, true, quote.error);
+  assert.equal(quote.data.expectedRewards[0].count, '6');
+  f.mutateReply = reply => ({ ...reply, sell_items: [{ ...reply.sell_items[0], uid: '9007199254741002' }] });
+  const result = await f.service.execute(quote.data.id);
+  assert.equal(result.data.outcome, 'unknown');
+  assert.equal(item.count, '3');
+  assert.equal((await f.make().execute(quote.data.id)).data.replayed, true);
+  assert.equal((await f.make().prepare('sell', input)).code, 'RANCH_RESULT_UNCONFIRMED');
+  assert.equal(f.writes, 1);
+});
+
+
+test('出售鸡蛋任务只卖进度缺口，进度延迟期间复查且不再次出售', async () => {
+  const f = fixture();
+  const task = { id: '300006', desc: '出售鸡蛋', progress: '1', total_progress: '3', task_type: 4, is_unlocked: true };
+  f.tasks.push(task);
+  f.products.push(ranchProduct('9007199254741001', '15', '1'));
+  const policy = (await f.service.getAutomation()).data.policy;
+  await f.service.setAutomation({ ...policy, enabled: true, eggSale: true });
+  f.advance(31000);
+  const result = await f.service.automate();
+  assert.equal(result.data.outcome, 'unknown', result.error);
+  assert.equal(result.data.taskSaleReceipt, true);
+  assert.equal(f.products[0].count, '13');
+  assert.equal((await f.service.acknowledge(result.data.id)).code, 'RANCH_AUTO_RECONCILING');
+  await f.service.automate();
+  assert.equal(f.calls.filter(method => method === 'Sell').length, 1);
+  task.progress = '3';
+  f.advance(31000);
+  await f.service.automate();
+  const snapshot = (await f.service.getState('tasks')).data;
+  assert.equal(snapshot.lastOperation.outcome, 'confirmed');
+  assert.equal(snapshot.tasks[0].canClaim, true);
+  assert.equal(f.calls.filter(method => method === 'Sell').length, 1);
 });

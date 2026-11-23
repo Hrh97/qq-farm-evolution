@@ -1,5 +1,5 @@
 import { defineStore } from 'pinia'
-import { computed, ref } from 'vue'
+import { computed, ref, toRaw } from 'vue'
 import api from '@/api'
 
 export const useRanchStore = defineStore('ranch', () => {
@@ -28,10 +28,14 @@ export const useRanchStore = defineStore('ranch', () => {
     quote.value = selected
     if (selected.deadline !== null) {
       const remaining = selected.deadline - performance.now()
-      if (remaining <= 0)
+      if (remaining <= 0) {
         reviewNotice.value = expiryNotice
-      else
-        expiryTimer = setTimeout(() => { reviewNotice.value = expiryNotice }, remaining)
+      }
+      else {
+        expiryTimer = setTimeout(() => {
+          reviewNotice.value = expiryNotice
+        }, remaining)
+      }
     }
   }
   const result = ref<any>(null)
@@ -51,14 +55,13 @@ export const useRanchStore = defineStore('ranch', () => {
   const controllers = new Set<AbortController>()
   const outcomes = new Map<string, any>()
   function cancel() {
+    void closeQuote()
     generation++
-    confirmationSequence++
     optionsSequence++
     reads.clear()
     loadingOptions.value = false
     for (const controller of controllers) controller.abort()
     controllers.clear()
-    clearQuote()
     loading.value = false
     preparing.value = false
     operating.value = false
@@ -78,6 +81,29 @@ export const useRanchStore = defineStore('ranch', () => {
     errorCode.value = ''
     result.value = outcomes.get(accountId.value) || null
   }
+  function sessionKey() {
+    try {
+      return typeof localStorage === 'undefined' ? '' : localStorage.getItem('admin_token') || ''
+    }
+    catch {
+      return ''
+    }
+  }
+  function accountHeaders(id: string, beforeSend?: () => void) {
+    return {
+      errorFeedback: 'consumer' as const,
+      headers: { 'x-account-id': id },
+      transformRequest: [(body: any, headers: any) => {
+        beforeSend?.()
+        // The shared request interceptor may have selected a different account.
+        headers['x-account-id'] = id
+        if (body === undefined)
+          return body
+        headers['Content-Type'] = 'application/json'
+        return JSON.stringify(body)
+      }],
+    }
+  }
   function requestConfig(id: string, token: number) {
     const controller = new AbortController()
     controllers.add(controller)
@@ -86,17 +112,10 @@ export const useRanchStore = defineStore('ranch', () => {
       config: {
         timeout: 30000,
         signal: controller.signal,
-        errorFeedback: 'consumer' as const,
-        headers: { 'x-account-id': id },
-        transformRequest: [(body: any, headers: any) => {
+        ...accountHeaders(id, () => {
           if (generation !== token || accountId.value !== id || controller.signal.aborted)
             throw Object.assign(new Error('已取消'), { code: 'ERR_CANCELED' })
-          headers['x-account-id'] = id
-          if (body === undefined)
-            return body
-          headers['Content-Type'] = 'application/json'
-          return JSON.stringify(body)
-        }],
+        }),
       },
     }
   }
@@ -104,6 +123,27 @@ export const useRanchStore = defineStore('ranch', () => {
     const body = e?.response?.data
     error.value = body?.error || e?.message || '牧场请求暂时失败，请稍后重试'
     errorCode.value = body?.code || ''
+  }
+  async function readFriend(gid?: string) {
+    const id = accountId.value
+    if (!id)
+      return null
+    const token = generation
+    const request = requestConfig(id, token)
+    try {
+      const { data } = await api.get(gid ? '/api/ranch/friend' : '/api/friends', {
+        ...request.config,
+        ...(gid && { params: { gid } }),
+      })
+      if (generation !== token)
+        return null
+      if (data?.ok !== true || data.data?.sceneRecoveryRequired)
+        throw new Error(data?.error || '好友牧场暂不可用，请稍后刷新')
+      return data.data
+    }
+    finally {
+      controllers.delete(request.controller)
+    }
   }
   async function automationRequest(policy?: Record<string, any>) {
     const id = accountId.value
@@ -203,12 +243,13 @@ export const useRanchStore = defineStore('ranch', () => {
     const token = generation
     const sequence = ++readSequence
     confirmationSequence++
+    preparing.value = false
     view.value = nextView
     shopId.value = nextShop
-    clearQuote()
     loading.value = true
     error.value = ''
     errorCode.value = ''
+    void closeQuote()
     try {
       const snapshot = await readSnapshot(id, token, nextView, nextShop)
       if (generation !== token || sequence !== readSequence)
@@ -217,8 +258,24 @@ export const useRanchStore = defineStore('ranch', () => {
       readError.value = false
       const previous = outcomes.get(id)
       const observed = snapshot.lastOperation
-      // A refresh that has not observed this operation cannot settle its outcome.
-      result.value = previous?.outcome === 'unknown' && observed?.id !== previous.id ? previous : observed || null
+      // A lost HTTP response may refer to a still-unconsumed feed quote, rather than the latest operation.
+      if (previous?.outcome === 'unknown' && previous.feedOperation && observed?.id !== previous.id) {
+        const request = requestConfig(id, token)
+        try {
+          const { data } = await api.post('/api/ranch/reconcile-feed', { operationId: previous.id }, request.config)
+          if (generation !== token || sequence !== readSequence || outcomes.get(id) !== previous)
+            return false
+          result.value = data?.ok === true && data.data?.id === previous.id
+            ? (['unknown', 'partial', 'pending'].includes(observed?.outcome) ? observed : data.data)
+            : previous
+        }
+        finally {
+          controllers.delete(request.controller)
+        }
+      }
+      else {
+        result.value = previous?.outcome === 'unknown' && observed?.id !== previous.id ? previous : observed || null
+      }
       outcomes.set(id, result.value)
       return true
     }
@@ -238,17 +295,18 @@ export const useRanchStore = defineStore('ranch', () => {
     const id = accountId.value
     if (!id || blocked.value)
       return false
+    if (!renewing)
+      void closeQuote()
     const token = generation
     const sequence = ++confirmationSequence
     preparing.value = true
-    if (!renewing)
-      clearQuote()
     error.value = ''
     errorCode.value = ''
     const request = requestConfig(id, token)
     try {
       const intent = { action, input: JSON.parse(JSON.stringify(input)) }
       const { data } = await api.post('/api/ranch/prepare', intent, request.config)
+      // An abandoned prepare can finish despite aborting the request. Its quote expires on the worker.
       if (generation !== token || sequence !== confirmationSequence)
         return false
       if (data?.ok !== true)
@@ -260,6 +318,12 @@ export const useRanchStore = defineStore('ranch', () => {
       const ttl = data.data.validForMs
       // A legacy server only supplies an absolute game time; let it validate that quote.
       const deadline = Number.isFinite(ttl) ? performance.now() + Math.max(0, ttl) : null
+      const previous = quote.value
+      if (renewing && previous?.id && previous.id !== data.data.id
+        && (previous.deadline === null || performance.now() < previous.deadline)) {
+        // A fresh review replaces the earlier one. If cancellation fails, its worker TTL still applies.
+        void cancelPreparedQuote(id, previous.id).catch(() => {})
+      }
       showQuote({ ...data.data, intent, deadline, renewed: renewing })
       return true
     }
@@ -273,7 +337,7 @@ export const useRanchStore = defineStore('ranch', () => {
     }
     finally {
       controllers.delete(request.controller)
-      if (generation === token)
+      if (generation === token && sequence === confirmationSequence)
         preparing.value = false
     }
   }
@@ -291,11 +355,20 @@ export const useRanchStore = defineStore('ranch', () => {
     clearQuote()
     operating.value = true
     error.value = ''
+    // A re-entered panel can observe a newer result before this HTTP request settles.
+    const lastOutcome = outcomes.get(id)
+    const pendingOutcome = { id: selected.id, action: selected.intent.action, outcome: 'unknown', label: selected.label, message: '请求结果正在确认；不会自动重试' }
+    outcomes.set(id, pendingOutcome)
+    const ownsOutcome = () => toRaw(outcomes.get(id)) === pendingOutcome
     const request = requestConfig(id, token)
     try {
       const { data } = await api.post('/api/ranch/operate', { quoteId: selected.id }, request.config)
       if (data?.ok !== true)
         throw Object.assign(new Error(data?.error || '操作未完成'), { response: { data } })
+      if (!data.data || typeof data.data !== 'object')
+        throw new Error('操作回执不完整，请刷新核对')
+      if (!ownsOutcome())
+        return false
       outcomes.set(id, data.data)
       if (generation !== token)
         return false
@@ -310,18 +383,24 @@ export const useRanchStore = defineStore('ranch', () => {
       return data.data.outcome === 'confirmed'
     }
     catch (e: any) {
+      if (!ownsOutcome())
+        return false
       const body = e?.response?.data
       if (body?.ok === false && body.operationNotSent === true && body.quoteId === selected.id && !body.sceneRecoveryRequired) {
+        const unsent = { id: selected.id, outcome: 'not_sent', label: selected.label, message: body.error || '本次请求未发出' }
+        outcomes.set(id, unsent)
         if (generation === token && sequence === confirmationSequence) {
           failure(e)
-          const unsent = { id: selected.id, outcome: 'not_sent', label: selected.label, message: error.value }
-          outcomes.set(id, unsent)
           result.value = unsent
           showQuote({ ...selected, notSentMessage: error.value })
         }
         return false
       }
       if (body?.ok === false && ['RANCH_QUOTE_EXPIRED', 'RANCH_STATE_CHANGED', 'RANCH_CONFIRMATION_MISSING', 'RANCH_SESSION_CHANGED'].includes(body.code)) {
+        if (lastOutcome)
+          outcomes.set(id, lastOutcome)
+        else
+          outcomes.delete(id)
         if (generation === token && sequence === confirmationSequence) {
           failure(e)
           if (!body.sceneRecoveryRequired && ['RANCH_QUOTE_EXPIRED', 'RANCH_STATE_CHANGED'].includes(body.code)) {
@@ -334,7 +413,9 @@ export const useRanchStore = defineStore('ranch', () => {
         }
         return false
       }
-      const uncertain = { id: selected.id, outcome: 'unknown', label: selected.label, message: '请求状态暂未确认，请刷新核对；不会自动重试' }
+      const action = selected.intent?.action
+      const feedOperation = action === 'addGrass' || (action === 'buy' && String(selected.intent?.input?.goodsId) === '10001' && String(selected.intent?.input?.shopId) === '6')
+      const uncertain = { id: selected.id, action, feedOperation, friendGid: selected.intent?.input?.hostGid, outcome: 'unknown', label: selected.label, message: feedOperation ? '牧草操作状态暂未确认，程序会自动读取库存，不会重发原单' : '请求状态暂未确认，请刷新核对；不会自动重试' }
       outcomes.set(id, uncertain)
       if (generation === token) {
         if (e?.code !== 'ERR_CANCELED')
@@ -384,9 +465,53 @@ export const useRanchStore = defineStore('ranch', () => {
         acknowledging.value = false
     }
   }
-  function closeQuote() {
-    confirmationSequence++
-    clearQuote()
+  async function cancelPreparedQuote(id: string, quoteId: string) {
+    const session = sessionKey()
+    // The request stays bound to this account even if the panel changes or unmounts.
+    const { data } = await api.post('/api/ranch/cancel', { quoteId }, {
+      ...accountHeaders(id, () => {
+        if (sessionKey() !== session)
+          throw Object.assign(new Error('已取消'), { code: 'ERR_CANCELED' })
+      }),
+      timeout: 5000,
+      // Consume auth failures here before the shared interceptor can clear a new login.
+      validateStatus: (status: number) => (status >= 200 && status < 300) || status === 401 || status === 403,
+    })
+    if (data?.ok !== true || data.data?.cancelled !== true)
+      throw Object.assign(new Error('无法取消这条牧场确认记录'), { response: { data } })
   }
-  return { accountId, view, shopId, state, loading, preparing, operating, acknowledging, error, errorCode, quote, reviewNotice, result, uncertain, blocked, automation, savingAutomation, optionState, optionShops, optionError, loadingOptions, loadOptions, loadAutomation: () => automationRequest(), saveAutomation: automationRequest, bind, cancel, refresh, prepare, execute, acknowledge, closeQuote }
+  async function closeQuote() {
+    const quoteId = quote.value?.id
+    const id = accountId.value
+    if (operating.value) {
+      confirmationSequence++
+      return false
+    }
+    if (!quoteId || !id) {
+      if (preparing.value) {
+        confirmationSequence++
+        preparing.value = false
+      }
+      return false
+    }
+    const token = generation
+    const session = sessionKey()
+    const sequence = ++confirmationSequence
+    const previousResult = result.value
+    clearQuote()
+    preparing.value = false
+    try {
+      await cancelPreparedQuote(id, quoteId)
+      return true
+    }
+    catch (e: any) {
+      if (generation === token && sessionKey() === session && accountId.value === id && sequence === confirmationSequence
+        && result.value === previousResult && !uncertain.value) {
+        error.value = `牧场取消未确认：${e?.response?.data?.error || e?.message || '请求失败'}`
+        errorCode.value = ''
+      }
+      return false
+    }
+  }
+  return { accountId, view, shopId, state, loading, preparing, operating, acknowledging, error, errorCode, quote, reviewNotice, result, uncertain, blocked, automation, savingAutomation, optionState, optionShops, optionError, loadingOptions, loadOptions, loadAutomation: () => automationRequest(), saveAutomation: automationRequest, bind, cancel, refresh, readFriend, prepare, execute, acknowledge, closeQuote }
 })
