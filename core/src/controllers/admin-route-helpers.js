@@ -93,11 +93,29 @@ function createAdminRouteHelpers({ store, userStore, logger, getProvider }) {
   // 的错误——含面板读取失败冷却提示——仍按原失败语义回 500，不按关键词放宽。
   const PANEL_NOT_READY_ERROR = '账号未就绪（未登录或连接未打开），请稍后重试';
 
+  // 治理器硬预算拒绝的固定文案前缀（reason 为白名单枚举：budget_total/method/friend）。
+  // 偷菜突发打满 60s 预算时，面板只读端点（背包/访客记录/狗礼物/神秘商店）也会被拦；
+  // 这类"本地零发送"拒绝是预期可重试状态，应按 200 + ok:false 返回，而不是 500。
+  // 用固定前缀 + 白名单 reason 精确匹配，不做模糊关键词放宽（与 PANEL_NOT_READY 同口径）。
+  const GOVERNED_BUDGET_MESSAGE_RE = /^请求被治理器拦截\(budget_(total|method|friend)\):\s/;
+
+  function isGovernedBudgetRejection(err) {
+    if (!err) return false;
+    // 结构化标记优先（本地调用、跨进程白名单字段保留时）
+    if (err.isGovernedRejection === true
+      && (err.governedReason === 'budget_total'
+        || err.governedReason === 'budget_method'
+        || err.governedReason === 'budget_friend')) return true;
+    // 文案兜底：worker 跨进程只保证 message 保留，格式固定
+    return GOVERNED_BUDGET_MESSAGE_RE.test(String(err.message || ''));
+  }
+
   function isExpectedProviderError(err) {
     const message = String((err && err.message) || '');
     return message === '账号未运行'
       || message === 'API Timeout'
-      || message === PANEL_NOT_READY_ERROR;
+      || message === PANEL_NOT_READY_ERROR
+      || isGovernedBudgetRejection(err);
   }
 
   function sendProviderError(res, err) {
