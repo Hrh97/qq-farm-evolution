@@ -45,13 +45,18 @@ export const useRanchStore = defineStore('ranch', () => {
   const optionShops = ref<Record<string, any>>({})
   const optionError = ref('')
   const loadingOptions = ref(false)
+  const readingCleanOperation = ref(false)
+  const cleanReadFailure = ref<{ id: string, message: string } | null>(null)
+  const cleanOperationError = computed(() => cleanReadFailure.value?.id === result.value?.id ? cleanReadFailure.value?.message : '')
   const reads = new Map<string, Promise<any>>()
   let optionsSequence = 0
-  const uncertain = computed(() => ['pending', 'unknown', 'partial'].includes(result.value?.outcome || ''))
+  const uncertain = computed(() => ['pending', 'unknown', 'partial'].includes(result.value?.outcome || '')
+    && !(result.value?.action === 'cleanFriend' && result.value?.cleanReview === 'deferred'))
   const blocked = computed(() => !state.value || readError.value || loading.value || preparing.value || operating.value || acknowledging.value || uncertain.value || !!state.value?.sceneRecoveryRequired)
   let generation = 0
   let readSequence = 0
   let confirmationSequence = 0
+  let friendReadSequence = 0
   const controllers = new Set<AbortController>()
   const outcomes = new Map<string, any>()
   function cancel() {
@@ -66,6 +71,8 @@ export const useRanchStore = defineStore('ranch', () => {
     preparing.value = false
     operating.value = false
     acknowledging.value = false
+    readingCleanOperation.value = false
+    cleanReadFailure.value = null
     savingAutomation.value = false
   }
   function bind(id: string) {
@@ -126,23 +133,63 @@ export const useRanchStore = defineStore('ranch', () => {
   }
   async function readFriend(gid?: string) {
     const id = accountId.value
-    if (!id)
+    if (!id || (gid && acknowledging.value))
       return null
     const token = generation
+    const sequence = gid ? ++friendReadSequence : friendReadSequence
     const request = requestConfig(id, token)
     try {
       const { data } = await api.get(gid ? '/api/ranch/friend' : '/api/friends', {
         ...request.config,
         ...(gid && { params: { gid } }),
       })
-      if (generation !== token)
+      if (generation !== token || (gid && sequence !== friendReadSequence))
         return null
       if (data?.ok !== true || data.data?.sceneRecoveryRequired)
         throw new Error(data?.error || '好友牧场暂不可用，请稍后刷新')
+      const receipt = data.data?.cleanOperation
+      if (gid && data.data?.host === gid && result.value?.outcome === 'unknown' && result.value?.friendGid === gid
+        && receipt?.id === result.value?.id && receipt?.action === 'cleanFriend' && receipt.friendGid === gid && receipt.outcome === 'acknowledged') {
+        result.value = receipt
+        outcomes.set(id, receipt)
+      }
       return data.data
     }
     finally {
       controllers.delete(request.controller)
+    }
+  }
+  async function refreshCleanOperation(manual = false) {
+    const id = accountId.value
+    const operation = result.value
+    if (!id || operation?.action !== 'cleanFriend' || (!uncertain.value && !(manual && operation.cleanReview === 'deferred'))
+      || readingCleanOperation.value || operating.value || acknowledging.value)
+      return false
+    const token = generation
+    const request = requestConfig(id, token)
+    readingCleanOperation.value = true
+    const ownsResult = () => generation === token && result.value === operation
+    try {
+      const { data } = await api.get('/api/ranch/clean-operation', { ...request.config, params: { operationId: operation.id } })
+      if (!ownsResult())
+        return false
+      if (data?.ok !== true || data.data?.id !== operation.id || data.data?.action !== 'cleanFriend')
+        throw Object.assign(new Error(data?.error || '清理记录暂不可用，请稍后再查'), { response: { data } })
+      result.value = data.data
+      outcomes.set(id, data.data)
+      cleanReadFailure.value = null
+      return true
+    }
+    catch (e: any) {
+      if (manual && ownsResult() && e?.code !== 'ERR_CANCELED') {
+        cleanReadFailure.value = { id: operation.id, message: e?.response?.data?.error || e?.message || '清理记录暂不可用，请稍后再查' }
+      }
+      return false
+    }
+    finally {
+      controllers.delete(request.controller)
+      if (generation === token)
+        readingCleanOperation.value = false
     }
   }
   async function automationRequest(policy?: Record<string, any>) {
@@ -273,8 +320,9 @@ export const useRanchStore = defineStore('ranch', () => {
           controllers.delete(request.controller)
         }
       }
-      else {
-        result.value = previous?.outcome === 'unknown' && observed?.id !== previous.id ? previous : observed || null
+      else if (!(previous?.action === 'cleanFriend' && (['acknowledged', 'not_sent'].includes(previous.outcome) || previous.cleanReview === 'deferred')
+        && observed?.id === previous.id && ['pending', 'unknown', 'partial'].includes(observed.outcome))) {
+        result.value = previous?.outcome === 'unknown' && previous.cleanReview !== 'deferred' && observed?.id !== previous.id ? previous : observed || null
       }
       outcomes.set(id, result.value)
       return true
@@ -415,7 +463,9 @@ export const useRanchStore = defineStore('ranch', () => {
       }
       const action = selected.intent?.action
       const feedOperation = action === 'addGrass' || (action === 'buy' && String(selected.intent?.input?.goodsId) === '10001' && String(selected.intent?.input?.shopId) === '6')
-      const uncertain = { id: selected.id, action, feedOperation, friendGid: selected.intent?.input?.hostGid, outcome: 'unknown', label: selected.label, message: feedOperation ? '牧草操作状态暂未确认，程序会自动读取库存，不会重发原单' : '请求状态暂未确认，请刷新核对；不会自动重试' }
+      const message = action === 'cleanFriend' ? '程序将自动核对清理结果'
+        : feedOperation ? '牧草操作状态暂未确认，程序会自动读取库存，不会重发原单' : '请求状态暂未确认，请刷新核对；不会自动重试'
+      const uncertain = { id: selected.id, action, feedOperation, friendGid: selected.intent?.input?.hostGid, outcome: 'unknown', label: selected.label, message }
       outcomes.set(id, uncertain)
       if (generation === token) {
         if (e?.code !== 'ERR_CANCELED')
@@ -436,6 +486,8 @@ export const useRanchStore = defineStore('ranch', () => {
     const id = accountId.value
     if (!selected || typeof operationId !== 'string' || !operationId || !uncertain.value || operating.value || loading.value || acknowledging.value)
       return false
+    if (selected.action === 'cleanFriend' && (selected.cleanReview !== 'not_admitted' || readingCleanOperation.value))
+      return false
     const token = generation
     const request = requestConfig(id, token)
     acknowledging.value = true
@@ -455,8 +507,9 @@ export const useRanchStore = defineStore('ranch', () => {
       return true
     }
     catch (e: any) {
-      if (ownsResult() && e?.code !== 'ERR_CANCELED')
+      if (ownsResult() && e?.code !== 'ERR_CANCELED') {
         failure(e)
+      }
       return false
     }
     finally {
@@ -513,5 +566,5 @@ export const useRanchStore = defineStore('ranch', () => {
       return false
     }
   }
-  return { accountId, view, shopId, state, loading, preparing, operating, acknowledging, error, errorCode, quote, reviewNotice, result, uncertain, blocked, automation, savingAutomation, optionState, optionShops, optionError, loadingOptions, loadOptions, loadAutomation: () => automationRequest(), saveAutomation: automationRequest, bind, cancel, refresh, readFriend, prepare, execute, acknowledge, closeQuote }
+  return { accountId, view, shopId, state, loading, preparing, operating, acknowledging, readingCleanOperation, cleanOperationError, error, errorCode, quote, reviewNotice, result, uncertain, blocked, automation, savingAutomation, optionState, optionShops, optionError, loadingOptions, loadOptions, loadAutomation: () => automationRequest(), saveAutomation: automationRequest, bind, cancel, refresh, refreshCleanOperation, readFriend, prepare, execute, acknowledge, closeQuote }
 })
