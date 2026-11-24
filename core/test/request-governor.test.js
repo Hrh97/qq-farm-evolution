@@ -79,6 +79,26 @@ test('critical low-frequency polls bypass the saturated total budget', () => {
     assert.equal(allLands.reason, 'critical_poll');
 });
 
+test('critical farm operations bypass the saturated total budget', () => {
+    governor.resetForTest();
+    // 偷菜突发打满 60s 总预算。
+    for (let i = 0; i < governor.TOTAL_LIMIT; i++) {
+        governor.recordSent('gamepb.visitpb.VisitService', 'Enter', true, T0);
+    }
+    // 务农/背包/访客记录是关键低频操作，不能被高频抢收饿死。
+    for (const [service, method] of [
+        ['gamepb.plantpb.PlantService', 'Farming'],
+        ['gamepb.itempb.ItemService', 'Bag'],
+        ['gamepb.interactpb.InteractService', 'InteractRecords'],
+    ]) {
+        const gate = governor.checkRequest(service, method, T0 + 1000);
+        assert.equal(gate.allowed, true, `${service}.${method} should bypass budget_total`);
+        assert.equal(gate.reason, 'critical_poll');
+    }
+    // 普通请求仍被拦截，豁免没有被滥用成全局旁路。
+    assert.equal(governor.checkRequest('svc.Farm', 'DoWork', T0 + 1000).allowed, false);
+});
+
 test('total budget scales with the roster and reports the same cap used in admission', () => {
     const at = T0 + 1000;
     governor.resetForTest();

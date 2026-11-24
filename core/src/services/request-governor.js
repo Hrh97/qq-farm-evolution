@@ -52,14 +52,19 @@ const WHITELIST = new Set([
     'gamepb.gatepb.GateService.Login',
     'gamepb.acepb.AceService.AntiData',
 ]);
-// 关键只读巡查：任务检查 / 农场地块检查。它们由调度器低频定时触发，本身
-// 不会形成请求风暴，但会被偷菜突发（enter_steal 单段可达 90/min）挤满的
-// 60s 总预算误伤（budget_total），造成「检查任务失败 / 获取全农场地块失败」
-// 等可见报错。给它们独立的预算豁免：仍照常 recordSent 计入画像（安全巡检
-// 可见），只是不被硬预算丢弃，避免核心巡查被高频抢收饿死。
+// 关键低频操作：任务检查 / 农场地块检查 / 一键务农 / 背包读取 / 访客记录。
+// 它们由调度器或农场主循环低频触发，本身不会形成请求风暴，但会被偷菜突发
+// （enter_steal 单段可达 90/min）挤满的 60s 总预算误伤（budget_total）。
+// 2026-11-24 实测同一类误伤还波及 Farming（一键务农，报「务农异常」）、
+// Bag（背包/化肥礼包）、InteractRecords（访客记录），一并纳入独立豁免：
+// 仍照常 recordSent 计入画像（安全巡检可见），只是不被硬预算丢弃，
+// 避免关键农场操作被高频抢收饿死。偷菜链路本身仍照常过闸。
 const CRITICAL_POLL_METHODS = new Set([
     'gamepb.taskpb.TaskService.TaskInfo',
     'gamepb.plantpb.PlantService.AllLands',
+    'gamepb.plantpb.PlantService.Farming',               // 一键务农（浇水/除草/除虫）
+    'gamepb.itempb.ItemService.Bag',                     // 背包读取 / 化肥礼包
+    'gamepb.interactpb.InteractService.InteractRecords', // 访客记录
 ]);
 // 施肥 HOT / 成熟竞速涉及的接口。它们仍计入请求画像，并沿用既有频率门控
 // （Harvest/Steal 的核心链白名单不变）；但短窗口内“别人先偷了/重复离场/
