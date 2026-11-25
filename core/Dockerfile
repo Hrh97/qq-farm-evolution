@@ -2,8 +2,8 @@ FROM docker.1ms.run/library/node:20-alpine AS builder
 
 WORKDIR /app
 
-ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
-ENV npm_config_registry=https://registry.npmmirror.com
+ENV COREPACK_NPM_REGISTRY=https://registry.npmjs.org
+ENV npm_config_registry=https://registry.npmjs.org
 
 RUN corepack enable
 
@@ -24,8 +24,8 @@ FROM docker.1ms.run/library/node:20-alpine AS prod-deps
 
 WORKDIR /app
 
-ENV COREPACK_NPM_REGISTRY=https://registry.npmmirror.com
-ENV npm_config_registry=https://registry.npmmirror.com
+ENV COREPACK_NPM_REGISTRY=https://registry.npmjs.org
+ENV npm_config_registry=https://registry.npmjs.org
 
 RUN corepack enable
 
