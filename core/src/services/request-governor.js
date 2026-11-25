@@ -170,8 +170,13 @@ function checkRequest(serviceName, methodName, now = Date.now(), options = {}) {
 
     // 施肥 HOT 内总预算同步放宽（目标好友需要高频往返，80/min 的常规预算
     // 会被盯梢+常规巡查挤满，导致 Enter 被拦、盯哨失明）
+    // 好友请求走独立 friend 预算（budget_friend），不受自己农场高频操作
+    // （Plant/RemovePlant/ShopInfo/Sell 等）打满 total 的连坐。否则一旦 total
+    // 被顶满，整条好友链路（GetAll/Enter/CheckCanOperate/帮浇水除草除虫）
+    // 全被 budget_total 拦截，好友互动每日任务会 0 次成功而永久卡住。
+    // friend 预算 + method 预算仍是硬上限，不会形成请求风暴。
     const totalLimit = effectiveTotalBudget(totalBudgetForRoster(policy, rosterSize), now);
-    if (windowEvents.length >= totalLimit) {
+    if (options.friend !== true && windowEvents.length >= totalLimit) {
         droppedTotal++;
         return { allowed: false, reason: 'budget_total' };
     }

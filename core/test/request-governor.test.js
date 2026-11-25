@@ -45,6 +45,21 @@ test('total budget drops non-whitelisted requests beyond the 60s limit', () => {
     assert.equal(over.reason, 'budget_total');
 });
 
+test('friend requests bypass a saturated total budget but stay under the friend budget', () => {
+    governor.resetForTest();
+    // 自己农场高频操作把 60s total 预算打满（这些 recordSent 不带 friend 标记）。
+    for (let i = 0; i < governor.TOTAL_LIMIT; i++) {
+        governor.recordSent('svc.Farm', `Do${i % 3}`, true, T0);
+    }
+    // 普通请求照常被 total 拦截。
+    const ordinary = governor.checkRequest('svc.Farm', 'Extra', T0 + 1000);
+    assert.equal(ordinary.allowed, false);
+    assert.equal(ordinary.reason, 'budget_total');
+    // 好友请求走独立 friend 预算，不被 total 连坐（好友互动每日任务依赖此链路）。
+    const friend = governor.checkRequest('gamepb.visitpb.VisitService', 'Enter', T0 + 1000, { friend: true });
+    assert.equal(friend.allowed, true, 'friend request must not be blocked by a saturated total budget');
+});
+
 test('whitelist and steal methods bypass the budget', () => {
     governor.resetForTest();
     for (let i = 0; i < governor.TOTAL_LIMIT + 5; i++) {
