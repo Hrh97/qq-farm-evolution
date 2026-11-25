@@ -946,7 +946,12 @@ function armStealWake(now = Date.now()) {
         // 避免统一 tick 的 100ms 地板把 GetAll 打成固定间隔请求风暴。
         nextStealRunAt = now + stealOverdueBackoffMs(stealOverdueStrikes);
         stealOverdueStrikes = Math.min(stealOverdueStrikes + 1, 8);
-        markStealDueAt(dueAt);
+        // 过期 due 必须指向本次退避后的未来重试时刻，不能停留在过去的成熟时刻：
+        // 否则 stealIsDue() 在整个退避窗口内恒真，runUnifiedTick 每轮都进 steal
+        // 分支并 return，帮助互动永远调度不到，且偷菜按 100ms 地板超频打满
+        // friend 60s 预算（实测单段 107 次），好友互动每日任务会永久卡住。
+        // 退避窗口内 stealIsDue()=false，帮好友/农场才有机会执行、预算也能退潮。
+        markStealDueAt(nextStealRunAt);
         return;
     }
     stealOverdueStrikes = 0;
