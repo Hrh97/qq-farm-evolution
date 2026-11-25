@@ -272,6 +272,7 @@ const DEFAULT_AUTOMATION = {
     milk_tea_hire_policy: milkTeaPolicy.cloneHirePolicy(milkTeaPolicy.DEFAULT_HIRE_POLICY),
     milk_tea_work_interaction_type: 1,
     fertilizer_gift: false,
+    seed_gift_auto_open: false,
     fertilizer_buy_organic: false,
     fertilizer_buy_normal: false,
     mystery_shop_auto_buy: false,

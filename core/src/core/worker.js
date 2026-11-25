@@ -153,7 +153,8 @@ const {
     sellAllFruits,
     getBag,
     getBagItems,
-    openFertilizerGiftPacksSilently
+    openFertilizerGiftPacksSilently,
+    openSeedGiftPacksSilently
 } = require('../services/warehouse');
 const {
     connect,
@@ -463,6 +464,7 @@ async function runFarmTick(autoConfig) {
         if (autoConfig.email) await checkAndClaimEmails();
         if (pauseRemainMsNow() > 0) return;
         if (autoConfig.fertilizer_gift) await openFertilizerGiftPacksSilently();
+        if (autoConfig.seed_gift_auto_open) await openSeedGiftPacksSilently();
     } catch { } finally {
         const patrol = randomIntervalMs(
             CONFIG.farmCheckIntervalMin || CONFIG.farmCheckInterval || 8000,
@@ -2257,6 +2259,10 @@ async function onLoginReady() {
     // 打开肥料礼包
     if (getAutomation().fertilizer_gift) {
         await openFertilizerGiftPacksSilently().catch(() => 0);
+    }
+    // 打开种子礼包（活动产出，放着不用浪费）
+    if (getAutomation().seed_gift_auto_open) {
+        await openSeedGiftPacksSilently().catch(() => 0);
     }
 
     // 延迟执行放虫放草

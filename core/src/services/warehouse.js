@@ -53,6 +53,7 @@ const ownQuietPriority = require('./own-quiet-priority');
 const sendMsgAsync = ownQuietPriority.wrapSend(nativeSendMsgAsync);
 const { types } = require('../utils/proto');
 const { toLong, toNum, log, logWarn, sleep } = require('../utils/utils');
+const { SEED_GIFT_PACK_IDS, collectSeedGiftPayloads } = require('./seed-gift-packs');
 const { updateStatusGold } = require('./status');
 const { auditBagSeedCoverage } = require('./seed-catalog-audit');
 
@@ -470,6 +471,50 @@ async function autoOpenFertilizerGiftPacks() {
 
 async function openFertilizerGiftPacksSilently() {
   return autoOpenFertilizerGiftPacks();
+}
+
+// ---- 种子礼包自动开启 ----
+// 识别逻辑在零依赖模块 seed-gift-packs.js（ID 白名单 + BatchUse 实测可用）。
+// 与化肥礼包通道互不干扰，由独立开关 seed_gift_auto_open 控制。
+async function autoOpenSeedGiftPacks() {
+  try {
+    const bag = await getBag();
+    const items = getBagItems(bag);
+    const payloads = collectSeedGiftPayloads(items);
+    if (payloads.length <= 0) return 0;
+
+    require('./automation-observability').logAutomationQuery('warehouse', '正在开启种子礼包');
+    let totalUsed = 0;
+    const labels = [];
+    for (const { id, count } of payloads) {
+      try {
+        // Use 的 uid 传 0 时由服务端从背包自查；礼包可批量一次开启。
+        await batchUseItems([{ itemId: id, count, uid: 0 }]);
+        totalUsed += count;
+        const info = getItemById(id);
+        labels.push(`${(info && info.name) || `礼包#${id}`}x${count}`);
+      } catch (err) {
+        logWarn('仓库', `开启种子礼包失败: id=${id} ${err.message}`, {
+          module: 'warehouse', event: '开启种子礼包', result: 'error', itemId: id,
+        });
+      }
+    }
+    if (totalUsed > 0) {
+      log('仓库', `种子礼包自动开启：${labels.join('、')}`, {
+        module: 'warehouse', event: '开启种子礼包', result: 'ok', count: totalUsed,
+      });
+    }
+    return totalUsed;
+  } catch (err) {
+    logWarn('仓库', `种子礼包自动开启检查失败: ${err.message}`, {
+      module: 'warehouse', event: '开启种子礼包', result: 'error', error: err.message,
+    });
+    return 0;
+  }
+}
+
+async function openSeedGiftPacksSilently() {
+  return autoOpenSeedGiftPacks();
 }
 
 // ---- 金币计算 ----
@@ -961,6 +1006,9 @@ module.exports = {
   useItem,
   batchUseItems,
   openFertilizerGiftPacksSilently,
+  autoOpenSeedGiftPacks,
+  openSeedGiftPacksSilently,
+  SEED_GIFT_PACK_IDS,
   getFertilizerGiftDailyState: () => ({
     key: 'fertilizer_gift_open',
     doneToday: fertilizerGiftDoneDateKey === getDateKey(),

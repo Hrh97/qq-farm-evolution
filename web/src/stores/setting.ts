@@ -41,6 +41,7 @@ export interface AutomationConfig {
   milk_tea_seed_policy?: MilkTeaSeedPolicy
   sell?: boolean
   fertilizer_gift?: boolean
+  seed_gift_auto_open?: boolean
   fertilizer_buy_organic?: boolean
   fertilizer_buy_normal?: boolean
   mystery_shop_auto_buy?: boolean

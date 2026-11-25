@@ -23,6 +23,7 @@ interface AutomationSettings {
     friend_help_exp_limit: boolean
     golden_bug_clear: boolean
     fertilizer_gift: boolean
+    seed_gift_auto_open: boolean
     fertilizer_buy_organic: boolean
     fertilizer_buy_normal: boolean
     mystery_shop_auto_buy: boolean
@@ -146,6 +147,7 @@ const mysteryShopSettingsVisible = ref(false)
         <BaseSwitch v-model="settings.automation.farm_push" label="推送触发巡田" />
         <BaseSwitch v-model="settings.automation.land_upgrade" label="自动升级土地" />
         <BaseSwitch v-model="settings.automation.fertilizer_gift" label="自动填充化肥" />
+        <BaseSwitch v-model="settings.automation.seed_gift_auto_open" label="自动开启种子礼包" />
         <BaseSwitch v-model="settings.automation.fertilizer_buy_organic" label="自动购买有机化肥" />
         <BaseSwitch v-model="settings.automation.fertilizer_buy_normal" label="自动购买无机化肥" />
         <div class="max-w-full w-fit inline-flex items-center gap-1.5">

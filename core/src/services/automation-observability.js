@@ -46,6 +46,7 @@ const CONTROL_LABELS = {
   friend: '好友巡查', friend_steal: '好友偷菜', friend_help: '好友帮助', friend_bad: '好友捣乱',
   friend_golden_bug: '好友黄金虫', friend_help_exp_limit: '帮助经验限制', farm_push: '土地推送响应',
   land_upgrade: '土地升级', golden_bug_clear: '清理黄金虫', fertilizer_gift: '化肥道具填充',
+  seed_gift_auto_open: '种子礼包自动开启',
   fertilizer_buy_organic: '购买有机化肥', fertilizer_buy_normal: '购买普通化肥', fertilizer: '施肥策略',
   skip_own_weed_bug: '跳过自家除草除虫', fertilizer_multi_season: '多季补肥', fertilizer_land_types: '施肥土地类型',
   mystery_shop_auto_buy: '神秘商人购买', mystery_shop_allow_gold: '商城金币消费',

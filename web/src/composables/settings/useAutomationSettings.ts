@@ -44,6 +44,7 @@ const defaultAutomation = {
   friend_help_exp_limit: false,
   golden_bug_clear: true,
   fertilizer_gift: false,
+  seed_gift_auto_open: false,
   fertilizer_buy_organic: false,
   fertilizer_buy_normal: false,
   mystery_shop_auto_buy: false,
