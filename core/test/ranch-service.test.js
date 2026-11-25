@@ -108,7 +108,11 @@ function fixture(upgrade = false) {
         if (f.rejectUnsent) throw Object.assign(new Error('synthetic budget rejection'), { isGovernedRejection: true });
         beforeWrite?.(); writes++;
         if (failure) throw decode(encode(Object.assign(new Error('synthetic timeout'), { code: 'LOCAL_REQUEST_TIMEOUT' })));
-        if (method === 'UpgradeBuilding') {
+        if (method === 'ClientReportProgress') {
+          assert.deepEqual(request, { task_id: '300008', progress: '1' });
+          f.tasks.find(task => task.id === request.task_id).progress = request.progress;
+          reply = { task_info: { growth_tasks: f.tasks } };
+        } else if (method === 'UpgradeBuilding') {
           assert.equal(request.inst_id, facilities[0].instance_id);
           gold -= f.upgradeCost; facilities[0].upgrade_state = 1; facilities[0].upgrade_end_time = String(Math.floor(now / 1000) + 10);
           reply = { upgrade: { inst_id: request.inst_id, target_facility_id: 6001002, target_level: 2, state: 1, end_time: facilities[0].upgrade_end_time } };
@@ -1707,6 +1711,45 @@ test('automation logs confirmed purchases with true receipt data and skips manua
   assert.equal(records.length, 1);
 });
 
+test('automatic harvest names reviewed rewards with exact receipt counts and logs confirmation once', async t => {
+  const records = ranchLogs(t);
+  const f = fixture();
+  const rewards = [
+    { id: '1065003', count: '5', name: '巨大鹅蛋' },
+    { id: '1065010', count: '9007199254740993', name: '巨大鼹鼠崽' },
+    { id: '2065003', count: '2', name: '巨大鹅' },
+  ];
+  f.mutateReply = reply => ({
+    ...reply,
+    op_results: reply.op_results.map(row => ({
+      ...row, rewards: rewards.map(({ id, count }) => ({ id, count })),
+    })),
+  });
+  await setOnlyAutomation(f, { harvest: true });
+  const result = await f.service.automate();
+  assert.equal(result.data.outcome, 'confirmed');
+  assert.deepEqual(result.data.rewards, rewards);
+  const actions = () => records.filter(row => row.meta?.event === 'ranch_automation_action');
+  assert.equal(actions().length, 1);
+  const [entry] = actions();
+  assert.equal(entry.tag, '牧场');
+  assert.equal(entry.isWarn, false);
+  assert.equal(entry.meta.action, 'harvest');
+  assert.equal(entry.meta.result, 'confirmed');
+  assert.equal(entry.meta.completed, 1);
+  assert.equal(entry.meta.requested, 1);
+  assert.deepEqual(entry.meta.rewards, rewards.map(({ name, count }) => ({ name, count })));
+  assert.match(entry.message, /自动收获.*巨大鹅蛋×5.*巨大鼹鼠崽×9007199254740993.*巨大鹅×2/);
+  assert.equal((await f.service.execute(result.data.id)).data.replayed, true);
+  assert.equal((await f.service.automate()).data.skipped, true);
+  f.facilities[0].ranch.animals[0].can_harvest = false;
+  f.advance(120000);
+  assert.equal((await f.service.automate()).data.skipped, true);
+  assert.equal(f.calls.filter(method => method === 'HarvestRanch').length, 1);
+  assert.equal(f.writes, 1);
+  assert.equal(actions().length, 1);
+});
+
 test('automation logs true confirmed partial amounts and clearly pauses, without another action entry on repeated ticks', async t => {
   const records = ranchLogs(t);
   const f = fixture();
@@ -1981,4 +2024,28 @@ test('出售鸡蛋任务只卖进度缺口，进度延迟期间复查且不再�
   assert.equal(snapshot.lastOperation.outcome, 'confirmed');
   assert.equal(snapshot.tasks[0].canClaim, true);
   assert.equal(f.calls.filter(method => method === 'Sell').length, 1);
+});
+
+test('opening the ranch friend panel reports only the unlocked task and remembers server confirmation', async () => {
+  const f = fixture();
+  const task = { id: '300008', desc: '打开好友面板', task_type: 4, total_progress: '1', progress: '0', is_unlocked: false };
+  f.tasks = [task];
+  assert.deepEqual(await f.service.reportFriendPanel(), { ok: true, data: { completed: false } });
+  assert.deepEqual(f.calls, ['TaskInfo']);
+  task.is_unlocked = true;
+  assert.deepEqual(await f.service.reportFriendPanel(), { ok: true, data: { completed: true } });
+  assert.deepEqual(f.calls, ['TaskInfo', 'TaskInfo', 'ClientReportProgress']);
+  assert.deepEqual(await f.make().reportFriendPanel(), { ok: true, data: { completed: true } });
+  assert.equal(f.calls.length, 3);
+});
+
+test('opening the ranch friend panel reads back after an unknown report before it can send again', async () => {
+  const f = fixture();
+  f.tasks = [{ id: '300008', task_type: 4, total_progress: '1', progress: '0', is_unlocked: true }];
+  f.timeout();
+  assert.equal((await f.service.reportFriendPanel()).ok, false);
+  assert.deepEqual(await f.make().reportFriendPanel(), { ok: true, data: { completed: false } });
+  f.tasks[0].progress = '1';
+  assert.deepEqual(await f.make().reportFriendPanel(), { ok: true, data: { completed: true } });
+  assert.equal(f.calls.filter(method => method === 'ClientReportProgress').length, 1);
 });
