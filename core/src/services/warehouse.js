@@ -54,6 +54,7 @@ const sendMsgAsync = ownQuietPriority.wrapSend(nativeSendMsgAsync);
 const { types } = require('../utils/proto');
 const { toLong, toNum, log, logWarn, sleep } = require('../utils/utils');
 const { SEED_GIFT_PACK_IDS, collectSeedGiftPayloads } = require('./seed-gift-packs');
+const { NORMAL_FERTILIZER_ITEM_HOURS, ORGANIC_FERTILIZER_ITEM_HOURS } = require('../config/fertilizer-item-hours');
 const { updateStatusGold } = require('./status');
 const { auditBagSeedCoverage } = require('./seed-catalog-audit');
 
@@ -74,23 +75,8 @@ const FERTILIZER_RELATED_IDS = new Set([
   100003, 100004, 100005, 100006, 100007, 100008, 100009, 100010, 100011, 100012,
 ]);
 
-// 普通化肥每小时提供时间（按物品 ID）
-// 79873→1h, 80514→4h, 80003→8h, 80132→12h
-const NORMAL_FERTILIZER_ITEM_HOURS = new Map([
-  [79873, 1],
-  [80514, 4],
-  [80003, 8],
-  [80132, 12],
-]);
-
-// 有机化肥每小时提供时间（按物品 ID）
-// 80011→1h, 80012→4h, 80013→8h, 80014→12h
-const ORGANIC_FERTILIZER_ITEM_HOURS = new Map([
-  [80011, 1],
-  [80012, 4],
-  [80013, 8],
-  [80014, 12],
-]);
+// 普通/有机化肥道具时长映射已抽到 config/fertilizer-item-hours.js（零依赖纯数据），
+// 补齐了背包常见的 80001/80002/80004 三项，避免快满容器时按 1h 误算导致溢出浪费。
 
 // ---- 状态追踪 ----
 
