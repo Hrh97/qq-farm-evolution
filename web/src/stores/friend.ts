@@ -67,6 +67,8 @@ export const useFriendStore = defineStore('friend', () => {
   const watchlist = ref<WatchlistItem[]>([])
   const watchlistMeta = ref<WatchlistMeta>({ opSeq: 0, consumedOpSeq: 0 })
   const watchlistNotify = ref<WatchlistNotifyState>({ saved: false, notifyAttempted: false })
+  // 重点监控好友在线会话历史：gid -> { items, online, since, currentMs, todayCount, todayMs, ... }
+  const onlineHistory = ref<Record<string, any>>({})
   // 重点名单读取代次：clearFriendData 前移后，在途旧 GET 响应（含 resume/
   // remove 之前发起的快照）不再写回，避免旧暂停状态污染新展示
   let watchlistReqSeq = 0
@@ -99,6 +101,7 @@ export const useFriendStore = defineStore('friend', () => {
     watchlist.value = []
     watchlistMeta.value = { opSeq: 0, consumedOpSeq: 0 }
     watchlistNotify.value = { saved: false, notifyAttempted: false }
+    onlineHistory.value = {}
     watchlistReqSeq++
     accountEpoch++
     autoBadList.value = []
@@ -424,6 +427,27 @@ export const useFriendStore = defineStore('friend', () => {
     catch { /* ignore */ }
   }
 
+  // 读取重点好友在线会话历史（上线/下线时刻 + 在线时长）。可传 gids，
+  // 不传则由后端默认读当前重点监控名单。账号一致性守卫避免切号后写回旧数据。
+  async function fetchOnlineHistory(accountId: string, gids?: number[]) {
+    if (!accountId)
+      return
+    const requestedId = String(accountId)
+    try {
+      const params: Record<string, string> = {}
+      if (gids && gids.length) params.gids = gids.join(',')
+      const res = await api.get('/api/friend-online-history', {
+        headers: { 'x-account-id': accountId },
+        params,
+      })
+      if (!isCurrentAccount(requestedId))
+        return
+      if (res.data.ok)
+        onlineHistory.value = res.data.data || {}
+    }
+    catch { /* ignore */ }
+  }
+
   // 写操作统一走 applyWatchlistResponse（含保存失败时的回滚后名单快照）；
   // 生命周期代次或账号已变化（清空/切换/切回）→ 整体丢弃（stale=true 不写
   // 名单与通知、页面不弹错），成功响应与请求拒绝（catch）同等守卫——旧生命
@@ -718,6 +742,8 @@ export const useFriendStore = defineStore('friend', () => {
     watchlist,
     watchlistMeta,
     watchlistNotify,
+    onlineHistory,
+    fetchOnlineHistory,
     autoBadList,
     interactRecords,
     interactLoading,

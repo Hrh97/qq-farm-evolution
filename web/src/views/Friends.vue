@@ -37,6 +37,7 @@ const {
   watchlist,
   watchlistMeta,
   watchlistNotify,
+  onlineHistory,
   autoBadList,
   interactRecords,
   interactLoading,
@@ -56,6 +57,14 @@ const TABS = [
 ] as const
 
 const activeTab = ref<FriendTabKey>('friends')
+// 重点监控好友「在线记录」展开状态（gid -> 是否展开）
+const onlineHistoryExpanded = ref<Set<number>>(new Set())
+function toggleOnlineHistoryExpand(gid: number) {
+  const next = new Set(onlineHistoryExpanded.value)
+  if (next.has(gid)) next.delete(gid)
+  else next.add(gid)
+  onlineHistoryExpanded.value = next
+}
 const showConfirm = ref(false)
 const confirmMessage = ref('')
 const confirmLoading = ref(false)
@@ -114,12 +123,32 @@ const friendGidSet = computed(() => new Set(friends.value.map(f => Number(f.gid)
 const blacklistGidSet = computed(() => new Set(blacklist.value.map(item => Number(item.gid))))
 const watchlistGidSet = computed(() => new Set(watchlist.value.map(item => Number(item.gid))))
 
+// 在线时长格式化：毫秒 -> 「Xh Ym」/「Xm Ys」/「Xs」
+function formatOnlineDuration(ms: number): string {
+  const s = Math.max(0, Math.floor(Number(ms) / 1000))
+  if (s < 60) return `${s}秒`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}分${s % 60}秒`
+  const h = Math.floor(m / 60)
+  return `${h}小时${m % 60}分`
+}
+
+// 时刻格式化：毫秒时间戳 -> 「MM-DD HH:mm」
+function formatOnlineTime(ms: number): string {
+  if (!Number(ms)) return '—'
+  const d = new Date(Number(ms))
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 // 重点名单管理块条目：名称/头像由后端本地构建返回空值，这里与已加载好友
 // 列表拼接补齐；列表为空/账号停止时只显示 GID，操作不受影响。
+// 同时带上在线会话历史（上线/下线时刻 + 在线时长）。
 const watchlistManageItems = computed(() =>
   watchlist.value.map((item: any) => {
     const gid = Number(item.gid)
     const known = friends.value.find((f: any) => Number(f.gid) === gid)
+    const oh: any = onlineHistory.value[String(gid)] || onlineHistory.value[gid] || null
     return {
       gid,
       name: String(item.name || known?.name || known?.remark || ''),
@@ -127,6 +156,13 @@ const watchlistManageItems = computed(() =>
       paused: item.paused === true,
       pausedAt: Number(item.pausedAt) || 0,
       trailingFailures: Number(item.trailingFailures) || 0,
+      online: oh?.online === true,
+      since: Number(oh?.since) || 0,
+      currentMs: Number(oh?.currentMs) || 0,
+      todayCount: Number(oh?.todayCount) || 0,
+      todayMs: Number(oh?.todayMs) || 0,
+      totalMs: Number(oh?.totalMs) || 0,
+      sessions: Array.isArray(oh?.items) ? oh.items.slice(0, 8) : [],
     }
   }),
 )
@@ -346,6 +382,8 @@ async function loadData() {
     // 重点名单管理块只依赖配置+暂停镜像的本地构建：停止状态也要能加载
     // 与操作（不依赖 Worker 在线）；与好友列表读取互不阻塞、并发落地。
     friendStore.fetchWatchlist(currentAccountId.value)
+    // 在线会话历史（上线/下线/时长）跟随重点名单刷新
+    friendStore.fetchOnlineHistory(currentAccountId.value)
 
     if (acc.running) {
       avatarErrorKeys.value.clear()
@@ -380,6 +418,12 @@ useIntervalFn(() => {
     }
   }
 }, 1000)
+
+// 在线会话历史每 20 秒刷新：让"当前在线时长"走动、新上线/下线边沿及时出现。
+useIntervalFn(() => {
+  if (currentAccount.value?.running)
+    friendStore.fetchOnlineHistory(currentAccountId.value)
+}, 20_000)
 
 // 在线证据直连通道（2026-09-26）：statusStore 的独立订阅在日志展示筛选
 // 之前同步分发——Dashboard 关闭实时日志不再连坐好友在线点亮（短在线尤其
@@ -952,33 +996,70 @@ async function handleBatchAddKnownFriendGids() {
             <div
               v-for="item in watchlistManageItems"
               :key="item.gid"
-              class="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-gray-50 px-3 py-2 dark:bg-gray-700/50"
+              class="rounded-lg bg-gray-50 px-3 py-2 dark:bg-gray-700/50"
             >
-              <div class="min-w-0 flex flex-wrap items-center gap-2">
-                <span class="min-w-0 text-sm font-medium text-gray-800 [overflow-wrap:anywhere] dark:text-gray-200">
-                  {{ item.name || `GID:${item.gid}` }}
-                </span>
-                <span
-                  v-if="item.paused"
-                  class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
-                >
-                  基线巡田已暂停（连续被拒 {{ item.trailingFailures }} 次）
-                </span>
+              <div class="flex flex-wrap items-center justify-between gap-2">
+                <div class="min-w-0 flex flex-wrap items-center gap-2">
+                  <span class="min-w-0 text-sm font-medium text-gray-800 [overflow-wrap:anywhere] dark:text-gray-200">
+                    {{ item.name || `GID:${item.gid}` }}
+                  </span>
+                  <span
+                    v-if="item.online"
+                    class="inline-flex items-center gap-1 rounded bg-green-100 px-1.5 py-0.5 text-xs text-green-600 dark:bg-green-900/30 dark:text-green-400"
+                  >
+                    <span class="inline-block h-1.5 w-1.5 rounded-full bg-green-500" />在线中 · {{ formatOnlineDuration(item.currentMs) }}
+                  </span>
+                  <span
+                    v-if="item.paused"
+                    class="rounded bg-amber-100 px-1.5 py-0.5 text-xs text-amber-700 dark:bg-amber-900/30 dark:text-amber-400"
+                  >
+                    基线巡田已暂停（连续被拒 {{ item.trailingFailures }} 次）
+                  </span>
+                </div>
+                <div class="flex items-center gap-2">
+                  <button
+                    class="rounded bg-blue-100 px-2.5 py-1 text-xs text-blue-700 transition dark:bg-blue-900/30 dark:text-blue-400 hover:bg-blue-200 dark:hover:bg-blue-900/50"
+                    @click="toggleOnlineHistoryExpand(item.gid)"
+                  >
+                    {{ onlineHistoryExpanded.has(item.gid) ? '收起在线记录' : `在线记录（今日${item.todayCount}次）` }}
+                  </button>
+                  <button
+                    v-if="item.paused"
+                    class="rounded bg-green-100 px-2.5 py-1 text-xs text-green-700 transition dark:bg-green-900/30 dark:text-green-400 hover:bg-green-200 dark:hover:bg-green-900/50"
+                    @click="handleResumeWatchlist(item.gid)"
+                  >
+                    恢复巡田
+                  </button>
+                  <button
+                    class="rounded bg-red-100 px-2.5 py-1 text-xs text-red-600 transition dark:bg-red-900/30 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50"
+                    @click="handleRemoveWatchlist(item.gid)"
+                  >
+                    移出名单
+                  </button>
+                </div>
               </div>
-              <div class="flex items-center gap-2">
-                <button
-                  v-if="item.paused"
-                  class="rounded bg-green-100 px-2.5 py-1 text-xs text-green-700 transition dark:bg-green-900/30 dark:text-green-400 hover:bg-green-200 dark:hover:bg-green-900/50"
-                  @click="handleResumeWatchlist(item.gid)"
-                >
-                  恢复巡田
-                </button>
-                <button
-                  class="rounded bg-red-100 px-2.5 py-1 text-xs text-red-600 transition dark:bg-red-900/30 dark:text-red-400 hover:bg-red-200 dark:hover:bg-red-900/50"
-                  @click="handleRemoveWatchlist(item.gid)"
-                >
-                  移出名单
-                </button>
+
+              <!-- 在线历史展开区：上线/下线时刻 + 每段时长 -->
+              <div v-if="onlineHistoryExpanded.has(item.gid)" class="mt-2 border-t border-gray-200 pt-2 dark:border-gray-600">
+                <div class="mb-2 flex flex-wrap gap-3 text-xs text-gray-500 dark:text-gray-400">
+                  <span>今日在线 <b class="text-gray-700 dark:text-gray-200">{{ formatOnlineDuration(item.todayMs) }}</b></span>
+                  <span>今日上线 <b class="text-gray-700 dark:text-gray-200">{{ item.todayCount }}</b> 次</span>
+                  <span>累计在线 <b class="text-gray-700 dark:text-gray-200">{{ formatOnlineDuration(item.totalMs) }}</b></span>
+                </div>
+                <div v-if="item.sessions.length === 0" class="text-xs text-gray-400">暂无在线记录（检测到上线/下线边沿后自动记录）</div>
+                <div v-else class="space-y-1">
+                  <div
+                    v-for="(s, idx) in item.sessions"
+                    :key="idx"
+                    class="flex flex-wrap items-center gap-2 text-xs text-gray-600 dark:text-gray-300"
+                  >
+                    <span class="inline-block h-1.5 w-1.5 rounded-full bg-blue-400" />
+                    <span>{{ formatOnlineTime(s.onAt) }}</span>
+                    <span class="text-gray-400">→</span>
+                    <span>{{ s.offAt ? formatOnlineTime(s.offAt) : '仍在线' }}</span>
+                    <span class="rounded bg-gray-200 px-1.5 py-0.5 dark:bg-gray-600">在线 {{ formatOnlineDuration(s.durationMs || s.offAt - s.onAt || 0) }}</span>
+                  </div>
+                </div>
               </div>
             </div>
           </div>

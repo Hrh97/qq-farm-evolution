@@ -9,6 +9,7 @@ const BUSINESS_DOMAINS = [
   "services/farming-orchestrator.js",
   "services/mall.js",
   "services/friend-activity.js",
+  "services/friend-online-history.js",
   "services/friend-api.js",
   "services/interact.js",
   "services/governed-warn-aggregation.js",

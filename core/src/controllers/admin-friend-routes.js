@@ -137,6 +137,28 @@ function registerAdminFriendRoutes({
 }) {
   const access = { getAccountIdFromRequest, canAccessAccount };
 
+  // 重点监控好友在线会话历史：上线/下线时刻与在线时长。
+  // 读纯内存边沿记录；gids 不传时默认读当前重点监控名单。
+  app.get("/api/friend-online-history", async (req, res) => {
+    const accountId = getAccountOrRespond(req, res, access);
+    if (!accountId) return;
+    try {
+      let gids = Array.isArray(req.query.gids)
+        ? req.query.gids
+        : typeof req.query.gids === 'string' ? req.query.gids.split(',') : null;
+      if (!gids || gids.length === 0) {
+        gids = store.getWatchlistFriendGids ? store.getWatchlistFriendGids(accountId) : [];
+      }
+      const parsed = [...new Set(gids.map(Number).filter(n => Number.isFinite(n) && n > 0))];
+      const data = provider.getFriendOnlineHistory
+        ? await provider.getFriendOnlineHistory(accountId, parsed)
+        : {};
+      res.json({ ok: true, data: data || {} });
+    } catch (error) {
+      sendProviderError(res, error);
+    }
+  });
+
   app.get("/api/friends", async (req, res) => {
     const accountId = getAccountOrRespond(req, res, {
       ...access,

@@ -1613,6 +1613,10 @@ async function handleApiCall(msg) {
             case 'getFriends':
                 result = await getFriendsList(args[0] === true);
                 break;
+            case 'getFriendOnlineHistory':
+                // 纯内存边沿记录，读在线会话历史；不发起 RPC，账号未运行时也能读。
+                result = require('../services/friend-online-history').getHistoryFor(args[0] || []);
+                break;
             case 'probeFriendSummaryDrift':
                 // 只读探测（2026-09-22 在线信号验证）：间隔取两次全量好友摘要并
                 // diff 字段（gold/level/tags/plant 微态），输出哪些字段在好友

@@ -15,6 +15,9 @@
 
 const { toNum } = require('../utils/utils');
 const { log } = require('../utils/utils');
+// 在线会话历史：把本文件的上线/下线边沿落成「上线/下线时刻 + 在线时长」，
+// 供重点监控面板展示。只在真实边沿写入，不新增任何请求。
+const onlineHistory = require('./friend-online-history');
 
 // gid -> { at, source, detail }；at 为好友活跃的最近证据时刻（墙钟 ms）。
 const activityEvidence = new Map();
@@ -302,6 +305,10 @@ function noteAtHomeEdge(gid, atHome) {
   if (!id) return false;
   const prev = atHomeStates.get(id) === true;
   atHomeStates.set(id, atHome === true);
+  // 在线会话历史：进门回包的 at_home 上升沿=上线、下降沿=下线。
+  // 与批量在场边沿可能同拍，history 模块自带去重，重复信号被忽略。
+  if (atHome === true && !prev) onlineHistory.noteOnline(id, Date.now(), 'at_home');
+  else if (prev && atHome !== true) onlineHistory.noteOffline(id, Date.now(), 'at_home');
   return atHome === true && !prev;
 }
 
@@ -323,11 +330,14 @@ function notePresenceFromBatch(gid, lastOnlineSec, now = Date.now()) {
   if (!prev) return null; // 首次观测只建基线
   if (online && !prev.online) {
     recordActivity(id, now, 'presence_online', 'batch last_online cleared');
+    onlineHistory.noteOnline(id, now, 'presence_online');
     return 'online';
   }
   if (!online && prev.online) {
     const atMs = sec > 1e12 ? sec : sec > 1e9 ? sec * 1000 : now;
-    recordActivity(id, Math.min(atMs, now), 'last_online', String(sec));
+    const offlineAt = Math.min(atMs, now);
+    recordActivity(id, offlineAt, 'last_online', String(sec));
+    onlineHistory.noteOffline(id, offlineAt, 'last_online');
     return 'offline';
   }
   return null;
