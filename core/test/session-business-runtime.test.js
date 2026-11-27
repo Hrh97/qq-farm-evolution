@@ -7,7 +7,10 @@ test.after(() => fs.rmSync(temporary, { recursive: true, force: true }));
 const { createSessionHostCore } = require('../src/runtime/session-host-core');
 const { createSessionBusinessRuntime } = require('../src/runtime/session-business-runtime');
 const { encode, decode } = require('../src/runtime/session-codec');
+const { BUSINESS_DOMAINS } = require('../src/runtime/session-state-domains');
 const runtimeRoot = path.resolve(__dirname, '../..');
+// 严格 domain 数随清单变化（新增在线历史 domain 后 +1），不再硬编码 32。
+const EXPECTED_DOMAINS = BUSINESS_DOMAINS.length;
 
 test('real business Workers capture all state domains and retain the physical session during replacement', { timeout: 30000 }, async () => {
   let connectCount = 0; let revision = 0; let eventCallback;
@@ -68,7 +71,7 @@ test('all real gameplay domains, pending payloads and absolute timers survive a 
   try {
     await cold.prepare(); await cold.activate([]); checkpoint = decode(await cold.quiesce());
   } finally { await cold.terminate(); }
-  assert.equal(Object.keys(checkpoint.state.domains).length, 32);
+  assert.equal(Object.keys(checkpoint.state.domains).length, EXPECTED_DOMAINS);
   const domain = name => checkpoint.state.domains[name].value;
   const deadline = Date.now() + 600000;
   Object.assign(domain('services/planting-service.js'), { reserved2x2GroupKeys: ['1,2,3,4'],
@@ -171,7 +174,7 @@ test('warm restore clears old readiness when a newer socket is OPEN but has not 
   } finally { await warmed.terminate(); }
 });
 
-test('commerce panel caches migrate only their optional fields, retaining 32 strict domains and original deadlines', { timeout: 30000 }, async () => {
+test('commerce panel caches migrate only their optional fields, retaining strict domains and original deadlines', { timeout: 30000 }, async () => {
   let checkpoint; let requests = 0;
   const facts = () => ({ sequence: 1, host: { accountId: 'synthetic-commerce-migration' }, game: {
     platform: 'wx', connectionEpoch: 1, connected: true, readyState: 1, socketPresent: true,
@@ -182,7 +185,7 @@ test('commerce panel caches migrate only their optional fields, retaining 32 str
   const cold = await createSessionBusinessRuntime(options);
   try { await cold.prepare(); await cold.activate([]); checkpoint = decode(await cold.quiesce()); }
   finally { await cold.terminate(); }
-  assert.equal(Object.keys(checkpoint.state.domains).length, 32);
+  assert.equal(Object.keys(checkpoint.state.domains).length, EXPECTED_DOMAINS);
   const mall = checkpoint.state.domains['services/mall.js'].value;
   const month = checkpoint.state.domains['services/monthcard.js'].value;
   for (const key of ['panelCatalogCache', 'panelCatalogCacheAt', 'panelCatalogRetryAfter', 'regularPanelCache']) delete mall[key];
@@ -192,7 +195,7 @@ test('commerce panel caches migrate only their optional fields, retaining 32 str
   try {
     await warm.prepare(); await warm.activate([]);
     const restored = decode(await warm.quiesce());
-    assert.equal(Object.keys(restored.state.domains).length, 32);
+    assert.equal(Object.keys(restored.state.domains).length, EXPECTED_DOMAINS);
     assert.deepEqual(restored.state.domains['services/mall.js'].value.regularPanelCache, {});
     assert.equal(restored.state.domains['services/monthcard.js'].value.panelMonthCardCache, null);
     assert.deepEqual(restored.timers, checkpoint.timers); assert.equal(requests, before);
