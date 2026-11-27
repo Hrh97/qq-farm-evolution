@@ -471,6 +471,7 @@ async function fetchFriendsListOnce(forceRefresh) {
  * Caches guard dog (护主犬, id=90021) info locally.
  */
 async function fetchFriendsDogInfo() {
+  const generation = friendsListGeneration;
   const accountId = process.env.FARM_ACCOUNT_ID || '';
   let friends = friendsListCache;
 
@@ -505,22 +506,22 @@ async function fetchFriendsDogInfo() {
     }
   }
 
-  // 走统一替换入口而不是直接赋值：狗信息合并写缓存也按外部替换处理
-  // （代次 +1），否则并发在途的面板列表读取完成后会用无狗信息的结果
-  // 覆盖这份已合并狗信息的缓存
-  setFriendsListCache(friends);
+  // 删除或清除名单发生后，旧狗信息不能写回旧名单。
+  if (generation === friendsListGeneration) {
+    setFriendsListCache(friends);
 
-  // Persist guard dog info to disk cache
-  if (accountId && Object.keys(guardDogFriends).length > 0) {
-    writeFriendDogInfoCache(accountId, guardDogFriends);
-    log('好友',
-      `已保存 ${Object.keys(guardDogFriends).length} 个护主犬好友信息到本地缓存`,
-      {
-        module: 'friend',
-        event: '保存护主犬好友缓存',
-        count: Object.keys(guardDogFriends).length,
-      }
-    );
+    // Persist guard dog info to disk cache
+    if (accountId && Object.keys(guardDogFriends).length > 0) {
+      writeFriendDogInfoCache(accountId, guardDogFriends);
+      log('好友',
+        `已保存 ${Object.keys(guardDogFriends).length} 个护主犬好友信息到本地缓存`,
+        {
+          module: 'friend',
+          event: '保存护主犬好友缓存',
+          count: Object.keys(guardDogFriends).length,
+        }
+      );
+    }
   }
 
   const guardDogCount = friends.filter(f => f.dogId === 90021).length;
@@ -742,6 +743,10 @@ function setFriendsListCache(cache) {
   friendsListGeneration += 1;
 }
 
+function removeFriendFromListCache(gid) {
+  setFriendsListCache(friendsListCache?.filter(friend => Number(friend.gid) !== gid) ?? null);
+}
+
 // ===== Exports =====
 module.exports = {
   analyzeFriendLands,
@@ -751,6 +756,7 @@ module.exports = {
   fetchFriendsDogInfo,
   getFriendLandsDetail,
   getFriendsListCache,
+  removeFriendFromListCache,
   setFriendsListCache,
 };
 
@@ -758,7 +764,10 @@ module.exports = {
 if (globalThis.process?.env?.FARM_SESSION_BUSINESS === '1') {
   const { registerDataState } = require('./business-state');
   registerDataState('services/friend-land-analyzer.js', () => ({ friendsListCache, friendsListGeneration }), value => {
-      friendsListCache = value.friendsListCache;
+      // Older business sessions did not include login timestamps in their cached roster.
+      const cache = value.friendsListCache;
+      friendsListCache = Array.isArray(cache) && cache.every(friend => friend && Object.hasOwn(friend, 'lastLoginAt'))
+        ? cache : null;
       friendsListGeneration = value.friendsListGeneration;
   }, { idle: () => !friendsListInFlight, });
 }
