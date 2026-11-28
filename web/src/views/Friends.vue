@@ -163,6 +163,10 @@ const watchlistManageItems = computed(() =>
       todayMs: Number(oh?.todayMs) || 0,
       totalMs: Number(oh?.totalMs) || 0,
       sessions: Array.isArray(oh?.items) ? oh.items.slice(0, 8) : [],
+      // 数据来源：realtime=实时边沿 / server_fallback=服务端时间兜底 / none=无记录
+      evidence: String(oh?.evidence || ''),
+      fallback: oh?.fallback === true,
+      serverCorroboration: oh?.serverCorroboration || null,
     }
   }),
 )
@@ -1046,6 +1050,13 @@ async function handleBatchAddKnownFriendGids() {
                   <span>今日上线 <b class="text-gray-700 dark:text-gray-200">{{ item.todayCount }}</b> 次</span>
                   <span>累计在线 <b class="text-gray-700 dark:text-gray-200">{{ formatOnlineDuration(item.totalMs) }}</b></span>
                 </div>
+                <div v-if="item.fallback" class="mb-2 text-xs text-amber-600 dark:text-amber-400">
+                  服务端时间推算（bot 未在场时错过，仅供佐证）
+                </div>
+                <div v-else-if="item.serverCorroboration && (item.serverCorroboration.serverLoginAt || item.serverCorroboration.serverOfflineAt)" class="mb-2 text-xs text-gray-400">
+                  服务端佐证：登录 {{ item.serverCorroboration.serverLoginAt ? formatOnlineTime(item.serverCorroboration.serverLoginAt) : '-' }}
+                  · 离线 {{ item.serverCorroboration.serverOfflineAt ? formatOnlineTime(item.serverCorroboration.serverOfflineAt) : '-' }}
+                </div>
                 <div v-if="item.sessions.length === 0" class="text-xs text-gray-400">暂无在线记录（检测到上线/下线边沿后自动记录）</div>
                 <div v-else class="space-y-1">
                   <div
@@ -1058,6 +1069,7 @@ async function handleBatchAddKnownFriendGids() {
                     <span class="text-gray-400">→</span>
                     <span>{{ s.offAt ? formatOnlineTime(s.offAt) : '仍在线' }}</span>
                     <span class="rounded bg-gray-200 px-1.5 py-0.5 dark:bg-gray-600">在线 {{ formatOnlineDuration(s.durationMs || s.offAt - s.onAt || 0) }}</span>
+                    <span v-if="s.source === 'server_fallback'" class="rounded bg-amber-100 px-1.5 py-0.5 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300">推算</span>
                   </div>
                 </div>
               </div>
