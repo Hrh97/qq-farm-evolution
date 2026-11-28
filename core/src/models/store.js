@@ -907,6 +907,7 @@ function normalizeAccountConfig(raw, fallbackConfig = accountFallbackConfig) {
 
 function pickDefaultPlanConfig(raw) {
     const cfg = normalizeAccountConfig(raw, DEFAULT_ACCOUNT_CONFIG);
+    const relogin = raw?.kickoutRelogin;
     const automation = { ...cfg.automation };
     automation.milk_tea_seed_policy = milkTeaPolicy.cloneSeedPolicy(automation.milk_tea_seed_policy);
     automation.milk_tea_hire_policy = milkTeaPolicy.cloneHirePolicy(automation.milk_tea_hire_policy);
@@ -919,6 +920,10 @@ function pickDefaultPlanConfig(raw) {
         requestPolicy: { ...cfg.requestPolicy },
         intervals: { ...cfg.intervals },
         friendQuietHours: { ...cfg.friendQuietHours },
+        ...(relogin && typeof relogin === 'object' && !Array.isArray(relogin)
+            && (Object.hasOwn(relogin, 'delayMinutes') || Object.hasOwn(relogin, 'validUntil'))
+            ? { kickoutRelogin: { ...cfg.kickoutRelogin } }
+            : {}),
         stealDelaySeconds: cfg.stealDelaySeconds,
         plantOrderRandom: cfg.plantOrderRandom,
         plantDelaySeconds: cfg.plantDelaySeconds,
@@ -1956,7 +1961,7 @@ function getUserDefaultAccountPlan(username) {
         return {
             exists: false,
             enabled: true,
-            config: pickDefaultPlanConfig(DEFAULT_ACCOUNT_CONFIG),
+            config: pickDefaultPlanConfig(),
             updatedAt: 0
         };
     }
@@ -1989,7 +1994,8 @@ function setUserDefaultAccountPlan(username, rawConfig, options = {}) {
 function applyUserDefaultAccountPlan(username, accountId) {
     const plan = getUserDefaultAccountPlan(username);
     if (!plan.exists) throw new Error('尚未保存默认方案');
-    setAccountConfigSnapshot(accountId, plan.config);
+    const kickoutRelogin = plan.config.kickoutRelogin ?? getAccountConfigSnapshot(accountId).kickoutRelogin;
+    setAccountConfigSnapshot(accountId, { ...plan.config, kickoutRelogin });
     return getConfigSnapshot(accountId);
 }
 
